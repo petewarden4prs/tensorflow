@@ -263,14 +263,14 @@ class Im2ColConvFunctor {
     const size_t patches_per_chunk =
         max_chunk_size / (filter_value_count * sizeof(T1));
     const size_t chunk_value_count =
-      (max_chunk_size + (sizeof(T1) - 1)) / sizeof(T1);
+        (max_chunk_size + (sizeof(T1) - 1)) / sizeof(T1);
     // Because memory allocation is very expensive on mobile platforms, try to
     // allocate a persistent buffer that will be kept around between calls. We
     // use TensorFlow's resource management to ensure that the memory will be
     // released when the session is over.
     Im2ColBufferResource<T1, chunk_value_count>* im2col_buffer_resource;
-    std::function<Status(Im2ColBufferResource<T1, chunk_value_count>**)> creator =
-        [](Im2ColBufferResource<T1, chunk_value_count>** resource) {
+    std::function<Status(Im2ColBufferResource<T1, chunk_value_count>**)>
+        creator = [](Im2ColBufferResource<T1, chunk_value_count>** resource) {
           *resource = new Im2ColBufferResource<T1, chunk_value_count>();
           return Status::OK();
         };
@@ -377,7 +377,7 @@ class Im2ColConvFunctor {
             T3* chunk_output_data =
                 output_data + (start_patch_index * filter_count);
             TGemmFunctor gemm_functor;
-            gemm_functor(m, n, k, im2col_buffer, lda, filter_data, ldb,
+            gemm_functor(context, m, n, k, im2col_buffer, lda, filter_data, ldb,
                          chunk_output_data, ldc);
           }
         }

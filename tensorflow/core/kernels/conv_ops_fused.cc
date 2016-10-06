@@ -55,7 +55,7 @@ enum SamplingMode {
 // Combines bilinear resizing and mirror padding into the im2col transformation
 // stage of convolution.
 template <class T1, class T2, class T3, class TGemmFunctor,
-	  SamplingMode SampleMode>
+          SamplingMode SampleMode>
 class FusedResizeAndPadConvFunctor {
  public:
   void operator()(OpKernelContext* context, const Tensor& input,
@@ -239,7 +239,7 @@ class FusedResizeAndPadConvFunctor {
             T3* chunk_output_data =
                 output_data + (start_patch_index * filter_count);
             TGemmFunctor gemm_functor;
-            gemm_functor(m, n, k, im2col_buffer, lda, filter_data, ldb,
+            gemm_functor(context, m, n, k, im2col_buffer, lda, filter_data, ldb,
                          chunk_output_data, ldc);
           }
         }
