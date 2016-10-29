@@ -219,6 +219,20 @@ class Im2ColConvFunctor {
       return;
     }
 
+    if (filter_height == filter_width && filter_width == 1 &&
+        stride_rows == 1 && stride_cols == 1) {
+      const int m = input_batches * input_width * input_height;
+      const int n = filter_count;
+      const int k = input_depth;
+      const int lda = k;
+      const int ldb = filter_count;
+      const int ldc = filter_count;
+      TGemmFunctor gemm_functor;
+      gemm_functor(context, m, n, k, input_data, lda, filter_data, ldb,
+                   output_data, ldc);
+      return;
+    }
+
     // These calculations define how the patches will be positioned within the
     // input image. The actual definitions are quite complex, and rely on the
     // previously-calculated output size.

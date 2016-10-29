@@ -43,8 +43,9 @@ namespace {
 // going to be extremely large, so break it into chunks if it's bigger than
 // a limit. Each chunk will be processed serially, so we can refill the
 // buffer for the next chunk and reuse it, keeping maximum memory size down.
-// In this case, we've picked 16 megabytes as a reasonable limit.
+// In this case, we've picked 1 megabyte as a reasonable limit.
 const size_t kMaxChunkSize = (16 * 1024 * 1024);
+const size_t kResizeCacheSize = (8 * 1024 * 1024);
 
 // Lookup method used when resizing.
 enum SamplingMode {
@@ -139,6 +140,28 @@ class FusedResizeAndPadConvFunctor {
     OP_REQUIRES_OK(context, context->resource_manager()->LookupOrCreate(
                                 "Conv2d", "im2col_buffer",
                                 &im2col_buffer_resource, creator));
+
+    const int cache_start_x = -filter_left_offset;
+    const int cache_end_x =
+        (((output_width - 1) * stride_cols) - filter_left_offset) +
+        filter_width;
+    const size_t cache_line_width = cache_end_x - cache_start_x;
+    const size_t needed_resize_cache_count =
+        filter_height * cache_line_width * input_depth;
+    OP_REQUIRES(context,
+                (needed_resize_cache_count * sizeof(T1)) <= kResizeCacheSize,
+                errors::InvalidArgument("Input too large for resize cache"));
+    Im2ColBufferResource<T1, kResizeCacheSize>* resize_cache_resource;
+    std::function<Status(Im2ColBufferResource<T1, kResizeCacheSize>**)>
+        resize_creator =
+            [](Im2ColBufferResource<T1, kResizeCacheSize>** resource) {
+              *resource = new Im2ColBufferResource<T1, kResizeCacheSize>();
+              return Status::OK();
+            };
+    OP_REQUIRES_OK(context, context->resource_manager()->LookupOrCreate(
+                                "Conv2d", "resize_cache",
+                                &resize_cache_resource, resize_creator));
+
     // This means that multiple ops can't be run simultaneously on different
     // threads, because we have a single shared resource. The platforms this is
     // aimed at have intra-op parallelism as their focus though, so it shouldn't
@@ -147,11 +170,115 @@ class FusedResizeAndPadConvFunctor {
     core::ScopedUnref unref_buffer(im2col_buffer_resource);
     T1* im2col_buffer = im2col_buffer_resource->data;
 
-    typename TTypes<T1, 4>::ConstTensor input_data = input.tensor<T1, 4>();
+    // This buffer is used as a fairly heavy-weight cache for the resized and
+    // mirrored inputs to the im2col operation. The problem is that we want to
+    // keep the memory usage down by not rendering the fully resized and padded
+    // input tensor to the convolution into an entire buffer. The first approach
+    // to avoid this was to fold the bilinear filtering and padding spatial
+    // transformations into the im2col lookup itself. This successfully reduced
+    // memory usage, but because im2col can access an individual pixel for many
+    // different patches, the extra overhead of doing the same bilinear lookups
+    // repeatedly became too expensive.
+    // The resize cache is designed to avoid this problem by keeping a
+    // horizontal slice of the resized and padded input to the im2col
+    // precalculated, so that repeated accesses to the same pixel from different
+    // filter patches can just be copied from this cache. It's organized as a
+    // horizontal slice stretching across the whole virtual image, and as high
+    // as the filter window, so that as the patch processing moves across all
+    // the pixels are present, and before a new row of patches is started any
+    // previously calculated rows that are needed are maintained, with new rows
+    // calculated as required.
+    mutex_lock resize_lock_buffer(resize_cache_resource->mu);
+    core::ScopedUnref unref_resized_cache(resize_cache_resource);
+    T1* resize_cache = resize_cache_resource->data;
+
+    const T1* input_data = input.flat<T1>().data();
+    const int64 input_height = input.shape().dim_sizes()[1];
+    const int64 input_width = input.shape().dim_sizes()[2];
+
+    int end_cached_lines = std::numeric_limits<int>::min();
 
     for (int batch = 0; batch < input_batches; ++batch) {
+      const T1* input_batch_start =
+          input_data + (batch * input_height * input_width * input_depth);
       for (int out_y = 0; out_y < output_height; ++out_y) {
         const int in_y_origin = (out_y * stride_rows) - filter_top_offset;
+        const int cache_start_y = std::max(in_y_origin, end_cached_lines);
+        const int cache_end_y =
+            std::max((in_y_origin + filter_height), end_cached_lines);
+        for (int cache_y = cache_start_y; cache_y < cache_end_y; ++cache_y) {
+          int cache_index_y;
+          if (cache_y < 0) {
+            cache_index_y = filter_height + (cache_y % filter_height);
+          } else {
+            cache_index_y = cache_y % filter_height;
+          }
+          T1* cache_line_start =
+              resize_cache + (cache_index_y * cache_line_width * input_depth);
+          float in_y = (cache_y - top_padding);
+          if (in_y < 0) {
+            in_y = -(in_y + 1.0f - pad_offset);
+          } else if (in_y >= resized_height) {
+            in_y = (resized_height * 2.0f) - (in_y + 1.0f + pad_offset);
+          }
+          in_y *= st.height_scale;
+          const int64 top_y_index = static_cast<int64>(std::floor(in_y));
+          const int64 bottom_y_index =
+              std::min(static_cast<int64>(std::ceil(in_y)), (st.in_height - 1));
+          const T1 y_lerp = in_y - top_y_index;
+          const T1* input_top_row_start =
+              input_batch_start + (top_y_index * input_width * input_depth);
+          const T1* input_bottom_row_start =
+              input_batch_start + (bottom_y_index * input_width * input_depth);
+          for (int cache_x = cache_start_x; cache_x < cache_end_x; ++cache_x) {
+            const int cache_index_x = cache_x - cache_start_x;
+            T1* cache_line_pixel =
+                cache_line_start + (cache_index_x * input_depth);
+            float in_x = (cache_x - left_padding);
+            if (in_x < 0) {
+              in_x = -(in_x + 1.0f - pad_offset);
+            } else if (in_x >= resized_width) {
+              in_x = (resized_width * 2.0f) - (in_x + 1.0f + pad_offset);
+            }
+            in_x *= st.width_scale;
+            const int64 left_x_index = static_cast<int64>(std::floor(in_x));
+            const int64 right_x_index = std::min(
+                static_cast<int64>(std::ceil(in_x)), (st.in_width - 1));
+            const T1 x_lerp = in_x - left_x_index;
+            if ((cache_x < 0) || (cache_x >= padded_width) || (cache_y < 0) ||
+                (cache_y >= padded_height)) {
+              std::fill_n(cache_line_pixel, input_depth, T1(0));
+            } else {
+              if (SampleMode == NEAREST) {
+                const T1* input_top_left_pixel =
+                    input_top_row_start + (left_x_index * input_depth);
+                std::copy_n(input_top_left_pixel, input_depth,
+                            cache_line_pixel);
+              } else {
+                const T1* input_top_left_pixel =
+                    input_top_row_start + (left_x_index * input_depth);
+                const T1* input_top_right_pixel =
+                    input_top_row_start + (right_x_index * input_depth);
+                const T1* input_bottom_left_pixel =
+                    input_bottom_row_start + (left_x_index * input_depth);
+                const T1* input_bottom_right_pixel =
+                    input_bottom_row_start + (right_x_index * input_depth);
+                for (int in_channel = 0; in_channel < input_depth;
+                     ++in_channel) {
+                  const T1 top_left = input_top_left_pixel[in_channel];
+                  const T1 top_right = input_top_right_pixel[in_channel];
+                  const T1 bottom_left = input_bottom_left_pixel[in_channel];
+                  const T1 bottom_right = input_bottom_right_pixel[in_channel];
+                  const T1 top = top_left + (top_right - top_left) * x_lerp;
+                  const T1 bottom =
+                      bottom_left + (bottom_right - bottom_left) * x_lerp;
+                  cache_line_pixel[in_channel] = top + (bottom - top) * y_lerp;
+                }
+              }
+            }
+          }
+        }
+        end_cached_lines = cache_end_y;
         for (int out_x = 0; out_x < output_width; ++out_x) {
           const int in_x_origin = (out_x * stride_cols) - filter_left_offset;
           const int patch_index = (batch * output_width * output_height) +
@@ -160,63 +287,22 @@ class FusedResizeAndPadConvFunctor {
           T1* im2col_patch_start =
               im2col_buffer + (patch_index_within_chunk * filter_value_count);
           for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
-            const int conv_in_y = in_y_origin + filter_y;
-            float in_y = (conv_in_y - top_padding);
-            if (in_y < 0) {
-              in_y = -(in_y + 1.0f - pad_offset);
-            } else if (in_y >= resized_height) {
-              in_y = (resized_height * 2.0f) - (in_y + 1.0f + pad_offset);
-            }
-            in_y *= st.height_scale;
-            const int64 top_y_index = static_cast<int64>(std::floor(in_y));
-            const int64 bottom_y_index = std::min(
-                static_cast<int64>(std::ceil(in_y)), (st.in_height - 1));
-            const T1 y_lerp = in_y - top_y_index;
             T1* im2col_row_start =
                 im2col_patch_start + (filter_y * filter_width * input_depth);
-            for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
-              const int conv_in_x = in_x_origin + filter_x;
-              float in_x = (conv_in_x - left_padding);
-              if (in_x < 0) {
-                in_x = -(in_x + 1.0f - pad_offset);
-              } else if (in_x >= resized_width) {
-                in_x = (resized_width * 2.0f) - (in_x + 1.0f + pad_offset);
-              }
-              in_x *= st.width_scale;
-              const int64 left_x_index = static_cast<int64>(std::floor(in_x));
-              const int64 right_x_index = std::min(
-                  static_cast<int64>(std::ceil(in_x)), (st.in_width - 1));
-              const T1 x_lerp = in_x - left_x_index;
-              T1* im2col_row_pixel =
-                  im2col_row_start + (filter_x * input_depth);
-              for (int in_channel = 0; in_channel < input_depth; ++in_channel) {
-                T1 in_value;
-                if ((conv_in_x >= 0) && (conv_in_x < padded_width) &&
-                    (conv_in_y >= 0) && (conv_in_y < padded_height)) {
-                  if (SampleMode == NEAREST) {
-                    const T1 top_left(input_data(batch, top_y_index,
-                                                 left_x_index, in_channel));
-                    in_value = top_left;
-                  } else if (SampleMode == BILINEAR) {
-                    const T1 top_left(input_data(batch, top_y_index,
-                                                 left_x_index, in_channel));
-                    const T1 top_right(input_data(batch, top_y_index,
-                                                  right_x_index, in_channel));
-                    const T1 bottom_left(input_data(batch, bottom_y_index,
-                                                    left_x_index, in_channel));
-                    const T1 bottom_right(input_data(
-                        batch, bottom_y_index, right_x_index, in_channel));
-                    const T1 top = top_left + (top_right - top_left) * x_lerp;
-                    const T1 bottom =
-                        bottom_left + (bottom_right - bottom_left) * x_lerp;
-                    in_value = top + (bottom - top) * y_lerp;
-                  }
-                } else {
-                  in_value = T1(0);
-                }
-                im2col_row_pixel[in_channel] = in_value;
-              }
+            const int conv_in_y = in_y_origin + filter_y;
+            int cache_index_y;
+            if (conv_in_y < 0) {
+              cache_index_y = filter_height + (conv_in_y % filter_height);
+            } else {
+              cache_index_y = conv_in_y % filter_height;
             }
+            T1* cache_line_start =
+                resize_cache + (cache_index_y * cache_line_width * input_depth);
+            T1* cache_filter_row_start =
+                cache_line_start +
+                ((in_x_origin - cache_start_x) * input_depth);
+            std::copy_n(cache_filter_row_start, (filter_width * input_depth),
+                        im2col_row_start);
           }
           const bool is_last_in_chunk =
               (patch_index_within_chunk == (patches_per_chunk - 1));
@@ -482,14 +568,16 @@ class FusedResizeConv2DUsingGemmOp : public OpKernel {
     Tensor* output = nullptr;
     OP_REQUIRES_OK(context, context->allocate_output(0, out_shape, &output));
 
-    VLOG(2) << "Conv2D: in_depth = " << in_depth
+    VLOG(2) << "FusedConv2D: " << name() << ", in_depth = " << in_depth
             << ", padded_cols = " << padded_cols
+            << ", resized_cols = " << resized_cols
             << ", filter_cols = " << filter_cols
             << ", padded_rows = " << padded_rows
+            << ", resized_rows = " << resized_rows
             << ", filter_rows = " << filter_rows
             << ", stride_rows = " << stride_rows
             << ", stride_cols = " << stride_cols
-            << ", out_depth = " << out_depth;
+            << ", out_depth = " << out_depth << ", DoResize=" << DoResize;
 
     // If there is nothing to compute, return.
     if (out_shape.num_elements() == 0) {
