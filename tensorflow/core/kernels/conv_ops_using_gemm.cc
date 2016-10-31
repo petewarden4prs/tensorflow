@@ -44,6 +44,8 @@ limitations under the License.
 // and disable the standard EigenTensor one in other build setups, you'll need
 // to define it there too.
 
+#define EIGEN_USE_THREADS
+
 #include <string.h>
 #include <map>
 #include <vector>

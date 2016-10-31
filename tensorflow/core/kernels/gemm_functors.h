@@ -20,10 +20,15 @@ limitations under the License.
 // implemented as C++ template functors, so they're easy to swap into all of the
 // different kernels that use them.
 
+#if !defined(EIGEN_USE_THREADS)
+#error "EIGEN_USE_THREADS must be enabled by all .cc files including this."
+#endif  // EIGEN_USE_THREADS
+
 #include <string.h>
 #include <map>
 #include <vector>
 
+#include "tensorflow/core/common_runtime/threadpool_device.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_types.h"

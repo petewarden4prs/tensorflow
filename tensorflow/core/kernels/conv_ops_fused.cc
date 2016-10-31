@@ -16,6 +16,8 @@ limitations under the License.
 // Implements convolution operations with other kernels baked into the
 // processing, to optimize latency and memory usage.
 
+#define EIGEN_USE_THREADS
+
 #include <string.h>
 #include <map>
 #include <vector>
@@ -43,7 +45,7 @@ namespace {
 // going to be extremely large, so break it into chunks if it's bigger than
 // a limit. Each chunk will be processed serially, so we can refill the
 // buffer for the next chunk and reuse it, keeping maximum memory size down.
-// In this case, we've picked 1 megabyte as a reasonable limit.
+// In this case, we've picked 16 megabytes as a reasonable limit.
 const size_t kMaxChunkSize = (16 * 1024 * 1024);
 const size_t kResizeCacheSize = (8 * 1024 * 1024);
 
@@ -198,6 +200,8 @@ class FusedResizeAndPadConvFunctor {
 
     int end_cached_lines = std::numeric_limits<int>::min();
 
+    const bool do_im2col = true;
+
     for (int batch = 0; batch < input_batches; ++batch) {
       const T1* input_batch_start =
           input_data + (batch * input_height * input_width * input_depth);
@@ -206,78 +210,83 @@ class FusedResizeAndPadConvFunctor {
         const int cache_start_y = std::max(in_y_origin, end_cached_lines);
         const int cache_end_y =
             std::max((in_y_origin + filter_height), end_cached_lines);
-        for (int cache_y = cache_start_y; cache_y < cache_end_y; ++cache_y) {
-          int cache_index_y;
-          if (cache_y < 0) {
-            cache_index_y = filter_height + (cache_y % filter_height);
-          } else {
-            cache_index_y = cache_y % filter_height;
-          }
-          T1* cache_line_start =
-              resize_cache + (cache_index_y * cache_line_width * input_depth);
-          float in_y = (cache_y - top_padding);
-          if (in_y < 0) {
-            in_y = -(in_y + 1.0f - pad_offset);
-          } else if (in_y >= resized_height) {
-            in_y = (resized_height * 2.0f) - (in_y + 1.0f + pad_offset);
-          }
-          in_y *= st.height_scale;
-          const int64 top_y_index = static_cast<int64>(std::floor(in_y));
-          const int64 bottom_y_index =
-              std::min(static_cast<int64>(std::ceil(in_y)), (st.in_height - 1));
-          const T1 y_lerp = in_y - top_y_index;
-          const T1* input_top_row_start =
-              input_batch_start + (top_y_index * input_width * input_depth);
-          const T1* input_bottom_row_start =
-              input_batch_start + (bottom_y_index * input_width * input_depth);
-          for (int cache_x = cache_start_x; cache_x < cache_end_x; ++cache_x) {
-            const int cache_index_x = cache_x - cache_start_x;
-            T1* cache_line_pixel =
-                cache_line_start + (cache_index_x * input_depth);
-            float in_x = (cache_x - left_padding);
-            if (in_x < 0) {
-              in_x = -(in_x + 1.0f - pad_offset);
-            } else if (in_x >= resized_width) {
-              in_x = (resized_width * 2.0f) - (in_x + 1.0f + pad_offset);
-            }
-            in_x *= st.width_scale;
-            const int64 left_x_index = static_cast<int64>(std::floor(in_x));
-            const int64 right_x_index = std::min(
-                static_cast<int64>(std::ceil(in_x)), (st.in_width - 1));
-            const T1 x_lerp = in_x - left_x_index;
-            if ((cache_x < 0) || (cache_x >= padded_width) || (cache_y < 0) ||
-                (cache_y >= padded_height)) {
-              std::fill_n(cache_line_pixel, input_depth, T1(0));
+        if (do_im2col)
+          for (int cache_y = cache_start_y; cache_y < cache_end_y; ++cache_y) {
+            int cache_index_y;
+            if (cache_y < 0) {
+              cache_index_y = filter_height + (cache_y % filter_height);
             } else {
-              if (SampleMode == NEAREST) {
-                const T1* input_top_left_pixel =
-                    input_top_row_start + (left_x_index * input_depth);
-                std::copy_n(input_top_left_pixel, input_depth,
-                            cache_line_pixel);
+              cache_index_y = cache_y % filter_height;
+            }
+            T1* cache_line_start =
+                resize_cache + (cache_index_y * cache_line_width * input_depth);
+            float in_y = (cache_y - top_padding);
+            if (in_y < 0) {
+              in_y = -(in_y + 1.0f - pad_offset);
+            } else if (in_y >= resized_height) {
+              in_y = (resized_height * 2.0f) - (in_y + 1.0f + pad_offset);
+            }
+            in_y *= st.height_scale;
+            const int64 top_y_index = static_cast<int64>(std::floor(in_y));
+            const int64 bottom_y_index = std::min(
+                static_cast<int64>(std::ceil(in_y)), (st.in_height - 1));
+            const T1 y_lerp = in_y - top_y_index;
+            const T1* input_top_row_start =
+                input_batch_start + (top_y_index * input_width * input_depth);
+            const T1* input_bottom_row_start =
+                input_batch_start +
+                (bottom_y_index * input_width * input_depth);
+            for (int cache_x = cache_start_x; cache_x < cache_end_x;
+                 ++cache_x) {
+              const int cache_index_x = cache_x - cache_start_x;
+              T1* cache_line_pixel =
+                  cache_line_start + (cache_index_x * input_depth);
+              float in_x = (cache_x - left_padding);
+              if (in_x < 0) {
+                in_x = -(in_x + 1.0f - pad_offset);
+              } else if (in_x >= resized_width) {
+                in_x = (resized_width * 2.0f) - (in_x + 1.0f + pad_offset);
+              }
+              in_x *= st.width_scale;
+              const int64 left_x_index = static_cast<int64>(std::floor(in_x));
+              const int64 right_x_index = std::min(
+                  static_cast<int64>(std::ceil(in_x)), (st.in_width - 1));
+              const T1 x_lerp = in_x - left_x_index;
+              if ((cache_x < 0) || (cache_x >= padded_width) || (cache_y < 0) ||
+                  (cache_y >= padded_height)) {
+                std::fill_n(cache_line_pixel, input_depth, T1(0));
               } else {
-                const T1* input_top_left_pixel =
-                    input_top_row_start + (left_x_index * input_depth);
-                const T1* input_top_right_pixel =
-                    input_top_row_start + (right_x_index * input_depth);
-                const T1* input_bottom_left_pixel =
-                    input_bottom_row_start + (left_x_index * input_depth);
-                const T1* input_bottom_right_pixel =
-                    input_bottom_row_start + (right_x_index * input_depth);
-                for (int in_channel = 0; in_channel < input_depth;
-                     ++in_channel) {
-                  const T1 top_left = input_top_left_pixel[in_channel];
-                  const T1 top_right = input_top_right_pixel[in_channel];
-                  const T1 bottom_left = input_bottom_left_pixel[in_channel];
-                  const T1 bottom_right = input_bottom_right_pixel[in_channel];
-                  const T1 top = top_left + (top_right - top_left) * x_lerp;
-                  const T1 bottom =
-                      bottom_left + (bottom_right - bottom_left) * x_lerp;
-                  cache_line_pixel[in_channel] = top + (bottom - top) * y_lerp;
+                if (SampleMode == NEAREST) {
+                  const T1* input_top_left_pixel =
+                      input_top_row_start + (left_x_index * input_depth);
+                  std::copy_n(input_top_left_pixel, input_depth,
+                              cache_line_pixel);
+                } else {
+                  const T1* input_top_left_pixel =
+                      input_top_row_start + (left_x_index * input_depth);
+                  const T1* input_top_right_pixel =
+                      input_top_row_start + (right_x_index * input_depth);
+                  const T1* input_bottom_left_pixel =
+                      input_bottom_row_start + (left_x_index * input_depth);
+                  const T1* input_bottom_right_pixel =
+                      input_bottom_row_start + (right_x_index * input_depth);
+                  for (int in_channel = 0; in_channel < input_depth;
+                       ++in_channel) {
+                    const T1 top_left = input_top_left_pixel[in_channel];
+                    const T1 top_right = input_top_right_pixel[in_channel];
+                    const T1 bottom_left = input_bottom_left_pixel[in_channel];
+                    const T1 bottom_right =
+                        input_bottom_right_pixel[in_channel];
+                    const T1 top = top_left + (top_right - top_left) * x_lerp;
+                    const T1 bottom =
+                        bottom_left + (bottom_right - bottom_left) * x_lerp;
+                    cache_line_pixel[in_channel] =
+                        top + (bottom - top) * y_lerp;
+                  }
                 }
               }
             }
           }
-        }
         end_cached_lines = cache_end_y;
         for (int out_x = 0; out_x < output_width; ++out_x) {
           const int in_x_origin = (out_x * stride_cols) - filter_left_offset;
@@ -286,24 +295,26 @@ class FusedResizeAndPadConvFunctor {
           const int patch_index_within_chunk = patch_index % patches_per_chunk;
           T1* im2col_patch_start =
               im2col_buffer + (patch_index_within_chunk * filter_value_count);
-          for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
-            T1* im2col_row_start =
-                im2col_patch_start + (filter_y * filter_width * input_depth);
-            const int conv_in_y = in_y_origin + filter_y;
-            int cache_index_y;
-            if (conv_in_y < 0) {
-              cache_index_y = filter_height + (conv_in_y % filter_height);
-            } else {
-              cache_index_y = conv_in_y % filter_height;
+          if (do_im2col)
+            for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
+              T1* im2col_row_start =
+                  im2col_patch_start + (filter_y * filter_width * input_depth);
+              const int conv_in_y = in_y_origin + filter_y;
+              int cache_index_y;
+              if (conv_in_y < 0) {
+                cache_index_y = filter_height + (conv_in_y % filter_height);
+              } else {
+                cache_index_y = conv_in_y % filter_height;
+              }
+              T1* cache_line_start =
+                  resize_cache +
+                  (cache_index_y * cache_line_width * input_depth);
+              T1* cache_filter_row_start =
+                  cache_line_start +
+                  ((in_x_origin - cache_start_x) * input_depth);
+              std::copy_n(cache_filter_row_start, (filter_width * input_depth),
+                          im2col_row_start);
             }
-            T1* cache_line_start =
-                resize_cache + (cache_index_y * cache_line_width * input_depth);
-            T1* cache_filter_row_start =
-                cache_line_start +
-                ((in_x_origin - cache_start_x) * input_depth);
-            std::copy_n(cache_filter_row_start, (filter_width * input_depth),
-                        im2col_row_start);
-          }
           const bool is_last_in_chunk =
               (patch_index_within_chunk == (patches_per_chunk - 1));
           const bool is_last_overall =
