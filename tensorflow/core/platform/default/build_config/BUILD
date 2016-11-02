@@ -37,6 +37,16 @@ tf_cuda_library(
     }),
 )
 
+cc_library(
+    name = "stream_executor_no_cuda",
+    hdrs = [
+        "stream_executor_no_cuda.h",
+    ],
+    deps = [
+        "//tensorflow/stream_executor",
+    ],
+)
+
 # OSX framework for device driver access
 cc_library(
     name = "IOKit",
@@ -73,6 +83,14 @@ cc_library(
         "@highwayhash//:sip_hash",
         "@jpeg_archive//:jpeg",
         "@png_archive//:png",
+    ],
+)
+
+cc_library(
+    name = "jpeg",
+    copts = tf_copts(),
+    deps = [
+        "@jpeg_archive//:jpeg",
     ],
 )
 

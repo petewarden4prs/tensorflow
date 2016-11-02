@@ -10,6 +10,7 @@ licenses(["notice"])  # Apache 2.0
 
 exports_files(["LICENSE"])
 
+load("//tensorflow:tensorflow.bzl", "if_not_windows")
 load("//tensorflow:tensorflow.bzl", "tf_cuda_library")
 load("//tensorflow:tensorflow.bzl", "tf_gen_op_wrapper_py")
 load("//tensorflow:tensorflow.bzl", "tf_py_test")
@@ -39,8 +40,11 @@ py_library(
         ":platform_test",
         ":summary",
         ":training",
+        ":ops",
+        "//tensorflow/python/debug:debug_py",
+    ] + if_not_windows([
         "//tensorflow/contrib:contrib_py",
-    ],
+    ]),
 )
 
 py_library(
@@ -174,6 +178,7 @@ cc_library(
 cc_binary(
     name = "framework/test_file_system.so",
     srcs = ["framework/test_file_system.cc"],
+    copts = ["-Wno-sign-compare"],
     linkopts = select({
         "//conditions:default": [
             "-lm",
@@ -210,22 +215,6 @@ cc_library(
         "//tensorflow/core:protos_cc",
     ],
     alwayslink = 1,
-)
-
-cc_library(
-    name = "cpp_shape_inference",
-    srcs = ["framework/cpp_shape_inference.cc"],
-    hdrs = ["framework/cpp_shape_inference.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":numpy_lib",
-        ":py_func_lib",
-        "//tensorflow/c:tf_status_helper",
-        "//tensorflow/core:framework",
-        "//tensorflow/core:protos_cc",
-        "//third_party/py/numpy:headers",
-        "//util/python:python_headers",
-    ],
 )
 
 cc_library(
@@ -272,11 +261,13 @@ py_library(
         "framework/graph_util.py",
         "framework/importer.py",
         "framework/load_library.py",
+        "framework/meta_graph.py",
         "framework/random_seed.py",
         "framework/tensor_util.py",
     ],
     srcs_version = "PY2AND3",
     deps = [
+        ":cpp_shape_inference_proto_py",
         ":framework_for_generated_wrappers",
         ":pywrap_tensorflow",
     ],
@@ -322,6 +313,7 @@ py_library(
     deps = [
         ":device_lib",
         ":framework_test_lib",
+        ":gradient_checker",
         ":platform_test",
     ],
 )
@@ -416,6 +408,19 @@ py_test(
     ],
 )
 
+py_test(
+    name = "framework_meta_graph_test",
+    size = "small",
+    srcs = ["framework/meta_graph_test.py"],
+    main = "framework/meta_graph_test.py",
+    srcs_version = "PY2AND3",
+    deps = [
+        ":framework_test_lib",
+        ":platform_test",
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
 tf_gen_op_wrapper_py(
     name = "test_ops",
     out = "framework/test_ops.py",
@@ -455,6 +460,7 @@ py_test(
         ":gradients",
         ":math_ops",
         ":platform_test",
+        ":resources",
         ":session",
         ":sparse_ops",
         ":test_ops",
@@ -635,6 +641,11 @@ tf_gen_op_wrapper_private_py(
 
 tf_gen_op_wrapper_private_py(
     name = "random_ops_gen",
+    require_shape_functions = True,
+)
+
+tf_gen_op_wrapper_private_py(
+    name = "resource_variable_ops_gen",
     require_shape_functions = True,
 )
 
@@ -952,6 +963,28 @@ py_library(
         ":sparse_ops_gen",
         ":state_ops",
         ":state_ops_gen",
+    ],
+)
+
+py_library(
+    name = "resources",
+    srcs = ["ops/resources.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":array_ops",
+        ":control_flow_ops",
+        ":framework",
+        ":math_ops",
+    ],
+)
+
+py_library(
+    name = "resource_variable_ops",
+    srcs = ["ops/resource_variable_ops.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":framework",
+        ":resource_variable_ops_gen",
     ],
 )
 
@@ -1375,6 +1408,8 @@ py_library(
         ":partitioned_variables",
         ":random_ops",
         ":random_ops_gen",
+        ":resource_variable_ops",
+        ":resources",
         ":rnn",
         ":rnn_cell",
         ":script_ops",
@@ -1415,7 +1450,7 @@ cuda_py_test(
 
 cuda_py_test(
     name = "gradient_checker_test",
-    size = "small",
+    size = "medium",
     srcs = ["ops/gradient_checker_test.py"],
     additional_deps = [
         ":array_ops",
@@ -1474,7 +1509,6 @@ cuda_py_test(
     ],
     data = ["//tensorflow/core:image_testdata"],
     shard_count = 5,
-    tags = ["notsan"],
 )
 
 cuda_py_test(
@@ -1550,7 +1584,6 @@ cuda_py_test(
         ":lib",
         "//tensorflow:tensorflow_py",
     ],
-    tags = ["notsan"],
 )
 
 py_library(
@@ -1579,6 +1612,7 @@ py_library(
         ":sparse_ops",
         ":state_ops",
         ":string_ops",
+        ":summary",
         ":training_ops_gen",
         ":variable_scope",
         ":variables",
@@ -1656,6 +1690,7 @@ tf_proto_library(
         ["**/*.proto"],
         exclude = [
             "util/protobuf/compare_test.proto",
+            "framework/cpp_shape_inference.proto",
         ],
     ),
     go_api_version = 2,
@@ -1665,6 +1700,13 @@ tf_proto_library_py(
     name = "compare_test_proto",
     testonly = 1,
     srcs = ["util/protobuf/compare_test.proto"],
+)
+
+tf_proto_library(
+    name = "cpp_shape_inference_proto",
+    srcs = ["framework/cpp_shape_inference.proto"],
+    cc_api_version = 2,
+    cc_libs = ["//tensorflow/core:protos_all_cc"],
 )
 
 py_test(
@@ -1730,6 +1772,24 @@ py_library(
     srcs_version = "PY2AND3",
     deps = [
         ":pywrap_tensorflow",
+    ],
+)
+
+cc_library(
+    name = "cpp_shape_inference",
+    srcs = ["framework/cpp_shape_inference.cc"],
+    hdrs = ["framework/cpp_shape_inference.h"],
+    copts = ["-Wno-sign-compare"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":cpp_shape_inference_proto_cc",
+        ":numpy_lib",
+        ":py_func_lib",
+        "//tensorflow/c:tf_status_helper",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:protos_cc",
+        "//third_party/py/numpy:headers",
+        "//util/python:python_headers",
     ],
 )
 
@@ -1825,6 +1885,7 @@ tf_py_wrap_cc(
         "//tensorflow/c:tf_status_helper",
         "//tensorflow/core:lib",
         "//tensorflow/core/distributed_runtime:server_lib",
+        "//tensorflow/tools/tfprof/internal:print_model_analysis",
         "//util/python:python_headers",
     ] + tf_additional_lib_deps(),
 )
@@ -1873,6 +1934,15 @@ cuda_py_test(
     additional_deps = ["//tensorflow:tensorflow_py"],
 )
 
+tf_py_test(
+    name = "sync_replicas_optimizer_test",
+    size = "medium",
+    srcs = [
+        "training/sync_replicas_optimizer_test.py",
+    ],
+    additional_deps = ["//tensorflow:tensorflow_py"],
+)
+
 py_library(
     name = "timeline",
     srcs = ["client/timeline.py"],
@@ -1885,7 +1955,6 @@ py_library(
 # Just used by tests.
 tf_cuda_library(
     name = "construction_fails_op",
-    testonly = 1,
     srcs = ["client/test_construction_fails_op.cc"],
     deps = [
         "//tensorflow/core",
@@ -1968,7 +2037,6 @@ cuda_py_tests(
         "training/rmsprop_test.py",
         "training/saver_test.py",
         "training/slot_creator_test.py",
-        "training/summary_writer_test.py",
         "training/tensorboard_logging_test.py",
         "training/training_ops_test.py",
     ],
@@ -2069,6 +2137,7 @@ py_library(
     deps = [
         ":client",
         ":framework",
+        ":platform",
         ":protos_all_py",
         ":pywrap_tensorflow",
         ":summary_ops",
@@ -2085,9 +2154,9 @@ py_tests(
         "summary/event_multiplexer_test.py",
         "summary/impl/directory_watcher_test.py",
         "summary/impl/event_file_loader_test.py",
-        "summary/impl/gcs_file_loader_test.py",
         "summary/impl/reservoir_test.py",
         "summary/summary_test.py",
+        "summary/writer/writer_test.py",
     ],
     additional_deps = [
         ":summary",
@@ -2133,6 +2202,33 @@ py_binary(
     ],
 )
 
+# -----------------------------------------------------------------------------
+# Quantization
+
+py_test(
+    name = "dequantize_op_test",
+    size = "small",
+    srcs = ["ops/dequantize_op_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":ops",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:framework_test_lib",
+    ],
+)
+
+py_test(
+    name = "quantized_conv_ops_test",
+    size = "small",
+    srcs = ["ops/quantized_conv_ops_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":ops",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:framework_test_lib",
+    ],
+)
+
 filegroup(
     name = "all_files",
     srcs = glob(
@@ -2165,4 +2261,16 @@ cuda_py_test(
         "//tensorflow:tensorflow_py",
     ],
     main = "ops/batch_norm_benchmark.py",
+)
+
+cuda_py_test(
+    name = "concat_benchmark",
+    srcs = [
+        "ops/concat_benchmark.py",
+    ],
+    additional_deps = [
+        ":nn_ops",
+        "//tensorflow:tensorflow_py",
+    ],
+    main = "ops/concat_benchmark.py",
 )

@@ -23,10 +23,12 @@ import six
 
 from tensorflow.contrib import framework as contrib_framework
 from tensorflow.contrib import layers
+from tensorflow.contrib.framework.python.framework import experimental
 from tensorflow.contrib.learn.python.learn.estimators import estimator
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import clip_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import rnn
@@ -54,12 +56,12 @@ def _padding_mask(sequence_lengths, padded_length):
                        array_ops.expand_dims(sequence_lengths, 1))
 
 
-def _mask_activations_and_targets(activations, targets, sequence_lengths):
+def _mask_activations_and_labels(activations, labels, sequence_lengths):
   """Remove entries outside `sequence_lengths` and returned flattened results.
 
   Args:
     activations: output of the RNN, shape `[batch_size, padded_length, k]`.
-    targets: target values, shape `[batch_size, padded_length]`.
+    labels: label values, shape `[batch_size, padded_length]`.
     sequence_lengths: a `Tensor` of shape `[batch_size]` with the unpadded
       length of each sequence. If `None`, then each sequence is unpadded.
 
@@ -68,25 +70,25 @@ def _mask_activations_and_targets(activations, targets, sequence_lengths):
     removed for each batch. Batches are then concatenated. Shape
       `[tf.sum(sequence_lengths), k]` if `sequence_lengths` is not `None` and
       shape `[batch_size * padded_length, k]` otherwise.
-    targets_masked: target values after removing unneeded entries. Shape
+    labels_masked: label values after removing unneeded entries. Shape
       `[tf.sum(sequence_lengths)]` if `sequence_lengths` is not `None` and shape
       `[batch_size * padded_length]` otherwise.
   """
-  with ops.name_scope('mask_activations_and_targets',
-                      values=[activations, targets, sequence_lengths]):
-    targets_shape = array_ops.shape(targets)
-    batch_size = targets_shape[0]
-    padded_length = targets_shape[1]
+  with ops.name_scope('mask_activations_and_labels',
+                      values=[activations, labels, sequence_lengths]):
+    labels_shape = array_ops.shape(labels)
+    batch_size = labels_shape[0]
+    padded_length = labels_shape[1]
     if sequence_lengths is None:
       flattened_dimension = padded_length * batch_size
       activations_masked = array_ops.reshape(activations,
                                              [flattened_dimension, -1])
-      targets_masked = array_ops.reshape(targets, [flattened_dimension])
+      labels_masked = array_ops.reshape(labels, [flattened_dimension])
     else:
       mask = _padding_mask(sequence_lengths, padded_length)
       activations_masked = array_ops.boolean_mask(activations, mask)
-      targets_masked = array_ops.boolean_mask(targets, mask)
-    return activations_masked, targets_masked
+      labels_masked = array_ops.boolean_mask(labels, mask)
+    return activations_masked, labels_masked
 
 
 def _select_last_activations(activations, sequence_lengths):
@@ -119,6 +121,55 @@ def _select_last_activations(activations, sequence_lengths):
     return last_activations
 
 
+def _concatenate_context_input(sequence_input, context_input):
+  """Replicates `context_input` accross all timesteps of `sequence_input`.
+
+  Expands dimension 1 of `context_input` then tiles it `sequence_length` times.
+  This value is appended to `sequence_input` on dimension 2 and the result is
+  returned.
+
+  Args:
+    sequence_input: a `Tensor` of dtype `float32` and shape `[batch_size,
+      padded_length, d0]`.
+    context_input: a `Tensor` of dtype `float32` and shape `[batch_size, d1]`.
+
+  Returns:
+    A `Tensor` of dtype `float32` and shape `[batch_size, padded_length,
+    d0 + d1]`.
+
+  Raises:
+    ValueError: if `sequence_input` does not have rank 3 or `context_input` does
+      not have rank 2.
+  """
+  seq_rank_check = check_ops.assert_rank(
+      sequence_input,
+      3,
+      message='sequence_input must have rank 3',
+      data=[array_ops.shape(sequence_input)])
+  seq_type_check = check_ops.assert_type(
+      sequence_input,
+      dtypes.float32,
+      message='sequence_input must have dtype float32; got {}.'.format(
+          sequence_input.dtype))
+  ctx_rank_check = check_ops.assert_rank(
+      context_input,
+      2,
+      message='context_input must have rank 2',
+      data=[array_ops.shape(context_input)])
+  ctx_type_check = check_ops.assert_type(
+      context_input,
+      dtypes.float32,
+      message='context_input must have dtype float32; got {}.'.format(
+          context_input.dtype))
+  with ops.control_dependencies(
+      [seq_rank_check, seq_type_check, ctx_rank_check, ctx_type_check]):
+    padded_length = array_ops.shape(sequence_input)[1]
+    tiled_context_input = array_ops.tile(
+        array_ops.expand_dims(context_input, 1),
+        array_ops.concat(0, [[1], [padded_length], [1]]))
+  return array_ops.concat(2, [sequence_input, tiled_context_input])
+
+
 @six.add_metaclass(abc.ABCMeta)
 class _DynamicRNNEstimator(estimator.BaseEstimator):
   """Estimator that uses a dynamic RNN for sequences."""
@@ -127,10 +178,11 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
                cell,
                target_column,
                optimizer,
+               sequence_feature_columns,
+               context_feature_columns=None,
                model_dir=None,
                config=None,
                gradient_clipping_norm=None,
-               inputs_key='inputs',
                sequence_length_key='sequence_length',
                initial_state_key='initial_state',
                dtype=None,
@@ -145,13 +197,18 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
       target_column: an initialized `TargetColumn`, used to calculate loss and
         metrics.
       optimizer: an initialized `tensorflow.Optimizer`.
+      sequence_feature_columns: An iterable containing all the feature columns
+        describing sequence features. All items in the set should be instances
+        of classes derived from `FeatureColumn`.
+      context_feature_columns: An iterable containing all the feature columns
+        describing context features i.e. features that apply accross all time
+        steps. All items in the set should be instances of classes derived from
+        `FeatureColumn`.
       model_dir: The directory in which to save and restore the model graph,
         parameters, etc.
       config: A `RunConfig` instance.
       gradient_clipping_norm: parameter used for gradient clipping. If `None`,
         then no clipping is performed.
-      inputs_key: the key for input values in the features dict passed to
-        `fit()`.
       sequence_length_key: the key for the sequence length tensor in the
         features dict passed to `fit()`.
       initial_state_key: the key for input values in the features dict passed to
@@ -165,17 +222,23 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
         to CPU.
       name: Optional name for the `Estimator`.
       feature_engineering_fn: Feature engineering function. Takes features and
-                        targets which are the output of `input_fn` and
-                        returns features and targets which will be fed
+                        labels which are the output of `input_fn` and
+                        returns features and labels which will be fed
                         into the model.
+    Raises:
+      ValueError: `sequence_feature_columns` is `None` or [].
     """
     super(_DynamicRNNEstimator, self).__init__(
         model_dir=model_dir, config=config)
+    # TODO(jamieas): consider supporting models with only context features.
+    if not sequence_feature_columns:
+      raise ValueError('sequence_feature_columns must be a non-empty list.')
     self._cell = cell
     self._target_column = target_column
     self._optimizer = optimizer
+    self._context_feature_columns = context_feature_columns
+    self._sequence_feature_columns = sequence_feature_columns
     self._gradient_clipping_norm = gradient_clipping_norm
-    self._inputs_key = inputs_key
     self._sequence_length_key = sequence_length_key
     self._initial_state_key = initial_state_key
     self._dtype = dtype or dtypes.float32
@@ -184,9 +247,31 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
     self._name = name or 'DynamicRnnEstimator'
     self._feature_engineering_fn = (
         feature_engineering_fn or
-        (lambda features, targets: (features, targets)))
+        (lambda features, labels: (features, labels)))
 
-  def _construct_rnn(self, features):
+  def _get_model_input(self, features, weight_collections=None, scope=None):
+    # TODO(jamieas): add option to use context to construct initial state rather
+    # than appending it to sequence input.
+    initial_state = features.get(self._initial_state_key)
+
+    sequence_input = layers.sequence_input_from_feature_columns(
+        columns_to_tensors=features,
+        feature_columns=self._sequence_feature_columns,
+        weight_collections=weight_collections,
+        scope=scope)
+
+    if self._context_feature_columns is not None:
+      context_input = layers.input_from_feature_columns(
+          columns_to_tensors=features,
+          feature_columns=self._context_feature_columns,
+          weight_collections=weight_collections,
+          scope=scope)
+
+      sequence_input = _concatenate_context_input(sequence_input, context_input)
+
+    return initial_state, sequence_input
+
+  def _construct_rnn(self, initial_state, sequence_input):
     """Apply an RNN to `features`.
 
     The `features` dict must contain `self._inputs_key`, and the corresponding
@@ -201,28 +286,20 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
     `self._dtype`.
 
     Args:
-      features: a `dict` containing the input for the RNN and (optionally) an
-        initial state and information about sequence lengths.
+      initial_state: the initial state to pass the the RNN. If `None`, the
+        default starting state for `self._cell` is used.
+      sequence_input: a `Tensor` with shape `[batch_size, padded_length, d]`
+        that will be passed as input to the RNN.
 
     Returns:
       activations: the output of the RNN, projected to the appropriate number of
         dimensions.
       final_state: the final state output by the RNN.
-
-    Raises:
-      KeyError: if `features` does not contain `self._inputs_key`.
     """
     with ops.name_scope('RNN'):
-      inputs = features.get(self._inputs_key)
-      if inputs is None:
-        raise KeyError('features must contain the key {}'.format(
-            self._inputs_key))
-      if inputs.dtype != self._dtype:
-        inputs = math_ops.cast(inputs, self._dtype)
-      initial_state = features.get(self._initial_state_key)
       rnn_outputs, final_state = rnn.dynamic_rnn(
           cell=self._cell,
-          inputs=inputs,
+          inputs=sequence_input,
           initial_state=initial_state,
           dtype=self._dtype,
           parallel_iterations=self._parallel_iterations,
@@ -232,26 +309,26 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
           inputs=rnn_outputs,
           num_outputs=self._target_column.num_label_columns,
           activation_fn=None,
-          trainable=False)
+          trainable=True)
       return activations, final_state
 
   @abc.abstractmethod
-  def _activations_to_loss(self, features, activations, targets):
-    """Map `activations` and `targets` to a loss `Tensor`.
+  def _activations_to_loss(self, features, activations, labels):
+    """Map `activations` and `labels` to a loss `Tensor`.
 
     `activations` has shape `[batch_size, padded_length,
      self._target_column.num_label_columns]`. It is the output of
     `_construct_rnn`.
 
-    `targets` is a `Tensor` of shape `[batch_size, padded_length]`. The type
-    of `targets` depends on what type of `TargetColumn` is being used.
+    `labels` is a `Tensor` of shape `[batch_size, padded_length]`. The type
+    of `labels` depends on what type of `TargetColumn` is being used.
 
     Args:
       features: a `dict` containing the input and (optionally) sequence length
         information and initial state. This is the same `features` passed to
         `_construct_rnn`.
       activations: a `Tensor` of activations representing the output of the RNN.
-      targets: a `Tensor` of target values.
+      labels: a `Tensor` of label values.
 
     Returns:
       loss: A scalar `Tensor` representing the aggregated loss for the batch.
@@ -299,7 +376,7 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
           processed_gradients, global_step=global_step)
 
   @abc.abstractmethod
-  def _activations_to_eval_ops(self, features, activations, targets, metrics):
+  def _activations_to_eval_ops(self, features, activations, labels, metrics):
     """Map `activations` to eval operations.
 
     `activations` has shape [batch_size, time, num_labels]. `TargetColumn`s
@@ -310,7 +387,7 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
       features: a `dict` containing the input and (optionally) sequence length
         information and initial state.
       activations: logit values returned by `_construct_rnn`.
-      targets: a `Tensor` of target values.
+      labels: a `Tensor` of label values.
       metrics: a list of `Metric`s to evaluate. Possibly `None`.
 
     Returns:
@@ -318,28 +395,28 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
     """
     raise NotImplementedError()
 
-  def _get_train_ops(self, features, targets):
+  def _get_train_ops(self, features, labels):
     with ops.name_scope(self._name):
-      if isinstance(features, ops.Tensor):
-        features = {self._inputs_key: features}
-      activations, _ = self._construct_rnn(features)
-      loss = self._activations_to_loss(features, activations, targets)
+      features, labels = self._feature_engineering_fn(features, labels)
+      initial_state, sequence_input = self._get_model_input(features)
+      activations, _ = self._construct_rnn(initial_state, sequence_input)
+      loss = self._activations_to_loss(features, activations, labels)
       train_op = self._loss_to_train_op(loss)
       return train_op, loss
 
-  def _get_eval_ops(self, features, targets, metrics):
+  def _get_eval_ops(self, features, labels, metrics):
     with ops.name_scope(self._name):
-      if isinstance(features, ops.Tensor):
-        features = {self._inputs_key: features}
-      activations, _ = self._construct_rnn(features)
-      return self._activations_to_eval_ops(features, activations, targets,
+      features, labels = self._feature_engineering_fn(features, labels)
+      initial_state, sequence_input = self._get_model_input(features)
+      activations, _ = self._construct_rnn(initial_state, sequence_input)
+      return self._activations_to_eval_ops(features, activations, labels,
                                            metrics)
 
   def _get_predict_ops(self, features):
     with ops.name_scope(self._name):
-      if isinstance(features, ops.Tensor):
-        features = {self._inputs_key: features}
-      activations, state = self._construct_rnn(features)
+      features, _ = self._feature_engineering_fn(features, {})
+      initial_state, sequence_input = self._get_model_input(features)
+      activations, state = self._construct_rnn(initial_state, sequence_input)
       predictions = self._activations_to_predictions(features, activations)
       return {'predictions': predictions, 'state': state}
 
@@ -347,14 +424,14 @@ class _DynamicRNNEstimator(estimator.BaseEstimator):
 class _MultiValueRNNEstimator(_DynamicRNNEstimator):
   """An `Estimator` that maps sequences of inputs to sequences of outputs."""
 
-  def _activations_to_loss(self, features, activations, targets):
+  def _activations_to_loss(self, features, activations, labels):
     sequence_length = features.get(self._sequence_length_key)
-    # Mask the activations and targets past `sequence_length`. Note that the
-    # `Tensor`s returned by `_mask_activations_and_targets` are flattened.
+    # Mask the activations and labels past `sequence_length`. Note that the
+    # `Tensor`s returned by `_mask_activations_and_labels` are flattened.
     with ops.name_scope('activations_to_loss'):
-      activations_masked, targets_masked = _mask_activations_and_targets(
-          activations, targets, sequence_length)
-      return self._target_column.loss(activations_masked, targets_masked,
+      activations_masked, labels_masked = _mask_activations_and_labels(
+          activations, labels, sequence_length)
+      return self._target_column.loss(activations_masked, labels_masked,
                                       features)
 
   def _activations_to_predictions(self, unused_features, activations):
@@ -362,46 +439,46 @@ class _MultiValueRNNEstimator(_DynamicRNNEstimator):
       activations_shape = array_ops.shape(activations)
       flattened_activations = array_ops.reshape(activations,
                                                 [-1, activations_shape[2]])
-      predictions = self._target_column.activations_to_predictions(
+      predictions = self._target_column.logits_to_predictions(
           flattened_activations, proba=False)
       reshaped_predictions = array_ops.reshape(
           predictions, [activations_shape[0], activations_shape[1], -1])
       return array_ops.squeeze(reshaped_predictions, [2])
 
-  def _activations_to_eval_ops(self, features, activations, targets, metrics):
+  def _activations_to_eval_ops(self, features, activations, labels, metrics):
     with ops.name_scope('activations_to_eval_ops'):
-      activations_masked, targets_masked = _mask_activations_and_targets(
-          activations, targets, features.get(self._sequence_length_key))
+      activations_masked, labels_masked = _mask_activations_and_labels(
+          activations, labels, features.get(self._sequence_length_key))
 
       return self._target_column.get_eval_ops(features=features,
                                               logits=activations_masked,
-                                              targets=targets_masked,
+                                              labels=labels_masked,
                                               metrics=metrics)
 
 
 class _SingleValueRNNEstimator(_DynamicRNNEstimator):
   """An `Estimator` that maps sequences of inputs to single outputs."""
 
-  def _activations_to_loss(self, features, activations, targets):
+  def _activations_to_loss(self, features, activations, labels):
     with ops.name_scope('activations_to_loss'):
       sequence_lengths = features.get(self._sequence_length_key)
       last_activations = _select_last_activations(activations, sequence_lengths)
-      return self._target_column.loss(last_activations, targets, features)
+      return self._target_column.loss(last_activations, labels, features)
 
   def _activations_to_predictions(self, features, activations):
     with ops.name_scope('activations_to_predictions'):
       sequence_lengths = features.get(self._sequence_length_key)
       last_activations = _select_last_activations(activations, sequence_lengths)
-      return self._target_column.activations_to_predictions(
+      return self._target_column.logits_to_predictions(
           last_activations, proba=False)
 
-  def _activations_to_eval_ops(self, features, activations, targets, metrics):
+  def _activations_to_eval_ops(self, features, activations, labels, metrics):
     with ops.name_scope('activations_to_eval_ops'):
       sequence_lengths = features.get(self._sequence_length_key)
       last_activations = _select_last_activations(activations, sequence_lengths)
       return self._target_column.get_eval_ops(features=features,
                                               logits=last_activations,
-                                              targets=targets,
+                                              labels=labels,
                                               metrics=metrics)
 
 
@@ -468,7 +545,10 @@ def _get_rnn_cell(cell_type, num_units, num_layers):
   return cell
 
 
+@experimental
 def multi_value_rnn_regressor(num_units,
+                              sequence_feature_columns,
+                              context_feature_columns=None,
                               cell_type='basic_rnn',
                               cell_dtype=dtypes.float32,
                               num_rnn_layers=1,
@@ -482,6 +562,13 @@ def multi_value_rnn_regressor(num_units,
 
   Args:
     num_units: the size of the RNN cells.
+    sequence_feature_columns: An iterable containing all the feature columns
+      describing sequence features. All items in the set should be instances
+      of classes derived from `FeatureColumn`.
+    context_feature_columns: An iterable containing all the feature columns
+      describing context features i.e. features that apply accross all time
+      steps. All items in the set should be instances of classes derived from
+      `FeatureColumn`.
     cell_type: subclass of `RNNCell` or one of 'basic_rnn,' 'lstm' or 'gru'.
     cell_dtype: the dtype of the state and output for the given `cell_type`.
     num_rnn_layers: number of RNN layers.
@@ -503,14 +590,19 @@ def multi_value_rnn_regressor(num_units,
   return _MultiValueRNNEstimator(cell,
                                  target_column,
                                  optimizer,
+                                 sequence_feature_columns,
+                                 context_feature_columns,
                                  model_dir,
                                  config,
                                  gradient_clipping_norm,
                                  dtype=cell_dtype)
 
 
+@experimental
 def multi_value_rnn_classifier(num_classes,
                                num_units,
+                               sequence_feature_columns,
+                               context_feature_columns=None,
                                cell_type='basic_rnn',
                                cell_dtype=dtypes.float32,
                                num_rnn_layers=1,
@@ -525,6 +617,13 @@ def multi_value_rnn_classifier(num_classes,
   Args:
     num_classes: the number of classes for categorization.
     num_units: the size of the RNN cells.
+    sequence_feature_columns: An iterable containing all the feature columns
+      describing sequence features. All items in the set should be instances
+      of classes derived from `FeatureColumn`.
+    context_feature_columns: An iterable containing all the feature columns
+      describing context features i.e. features that apply accross all time
+      steps. All items in the set should be instances of classes derived from
+      `FeatureColumn`.
     cell_type: subclass of `RNNCell` or one of 'basic_rnn,' 'lstm' or 'gru'.
     cell_dtype: the dtype of the state and output for the given `cell_type`.
     num_rnn_layers: number of RNN layers.
@@ -546,13 +645,18 @@ def multi_value_rnn_classifier(num_classes,
   return _MultiValueRNNEstimator(cell,
                                  target_column,
                                  optimizer,
+                                 sequence_feature_columns,
+                                 context_feature_columns,
                                  model_dir,
                                  config,
                                  gradient_clipping_norm,
                                  dtype=cell_dtype)
 
 
+@experimental
 def single_value_rnn_regressor(num_units,
+                               sequence_feature_columns,
+                               context_feature_columns=None,
                                cell_type='basic_rnn',
                                cell_dtype=dtypes.float32,
                                num_rnn_layers=1,
@@ -566,6 +670,13 @@ def single_value_rnn_regressor(num_units,
 
   Args:
     num_units: the size of the RNN cells.
+    sequence_feature_columns: An iterable containing all the feature columns
+      describing sequence features. All items in the set should be instances
+      of classes derived from `FeatureColumn`.
+    context_feature_columns: An iterable containing all the feature columns
+      describing context features i.e. features that apply accross all time
+      steps. All items in the set should be instances of classes derived from
+      `FeatureColumn`.
     cell_type: subclass of `RNNCell` or one of 'basic_rnn,' 'lstm' or 'gru'.
     cell_dtype: the dtype of the state and output for the given `cell_type`.
     num_rnn_layers: number of RNN layers.
@@ -587,14 +698,19 @@ def single_value_rnn_regressor(num_units,
   return _SingleValueRNNEstimator(cell,
                                   target_column,
                                   optimizer,
+                                  sequence_feature_columns,
+                                  context_feature_columns,
                                   model_dir,
                                   config,
                                   gradient_clipping_norm,
                                   dtype=cell_dtype)
 
 
+@experimental
 def single_value_rnn_classifier(num_classes,
                                 num_units,
+                                sequence_feature_columns,
+                                context_feature_columns=None,
                                 cell_type='basic_rnn',
                                 cell_dtype=dtypes.float32,
                                 num_rnn_layers=1,
@@ -609,6 +725,13 @@ def single_value_rnn_classifier(num_classes,
   Args:
     num_classes: the number of classes for categorization.
     num_units: the size of the RNN cells.
+    sequence_feature_columns: An iterable containing all the feature columns
+      describing sequence features. All items in the set should be instances
+      of classes derived from `FeatureColumn`.
+    context_feature_columns: An iterable containing all the feature columns
+      describing context features i.e. features that apply accross all time
+      steps. All items in the set should be instances of classes derived from
+      `FeatureColumn`.
     cell_type: subclass of `RNNCell` or one of 'basic_rnn,' 'lstm' or 'gru'.
     cell_dtype: the dtype of the state and output for the given `cell_type`.
     num_rnn_layers: number of RNN layers.
@@ -630,6 +753,8 @@ def single_value_rnn_classifier(num_classes,
   return _SingleValueRNNEstimator(cell,
                                   target_column,
                                   optimizer,
+                                  sequence_feature_columns,
+                                  context_feature_columns,
                                   model_dir,
                                   config,
                                   gradient_clipping_norm,

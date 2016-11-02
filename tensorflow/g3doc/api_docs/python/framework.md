@@ -645,8 +645,8 @@ Note that this is unrelated to the
 
 The GraphDef version information of this graph.
 
-For details on the meaning of each version, see [`GraphDef`]
-(https://www.tensorflow.org/code/tensorflow/core/framework/graph.proto).
+For details on the meaning of each version, see
+[`GraphDef`](https://www.tensorflow.org/code/tensorflow/core/framework/graph.proto).
 
 ##### Returns:
 
@@ -750,6 +750,19 @@ with tf.Graph().as_default() as g:
 #### `tf.Graph.building_function` {#Graph.building_function}
 
 Returns True iff this graph represents a function.
+
+
+- - -
+
+#### `tf.Graph.clear_collection(name)` {#Graph.clear_collection}
+
+Clears all values in a collection.
+
+##### Args:
+
+
+*  <b>`name`</b>: The key for the collection. The `GraphKeys` class contains many
+    standard names for collections.
 
 
 - - -
@@ -1409,6 +1422,9 @@ if tf.constant(True):  # Will raise.
 if tf.constant(5) < tf.constant(7):  # Will raise.
   # ...
 ```
+
+This disallows ambiguities between testing the Python value vs testing the
+dynamic condition of the `Tensor`.
 
 ##### Raises:
 
@@ -2145,6 +2161,7 @@ The following `DType` objects are defined:
 * `tf.qint16`: Quantized 16-bit signed integer.
 * `tf.quint16`: Quantized 16-bit unsigned integer.
 * `tf.qint32`: Quantized 32-bit signed integer.
+* `tf.resource`: Handle to a mutable resource.
 
 In addition, variants of these types with the `_ref` suffix are
 defined for reference-typed tensors.
@@ -2217,7 +2234,7 @@ Returns a reference `DType` based on this `DType`.
 
 #### `tf.DType.is_floating` {#DType.is_floating}
 
-Returns whether this is a (real) floating point type.
+Returns whether this is a (non-quantized, real) floating point type.
 
 
 - - -
@@ -2268,6 +2285,23 @@ Returns a `numpy.dtype` based on this `DType`.
 #### `tf.DType.as_datatype_enum` {#DType.as_datatype_enum}
 
 Returns a `types_pb2.DataType` enum value based on this `DType`.
+
+
+
+- - -
+
+#### `tf.DType.limits` {#DType.limits}
+
+Return intensity limits, i.e. (min, max) tuple, of the dtype.
+
+##### Args:
+
+  clip_negative : bool, optional
+      If True, clip the negative range (i.e. return 0 for min intensity)
+      even if the image dtype allows negative values.
+Returns
+  min, max : tuple
+    Lower and upper intensity limits.
 
 
 
@@ -2324,6 +2358,13 @@ Returns True iff self != other.
 - - -
 
 #### `tf.DType.__str__()` {#DType.__str__}
+
+
+
+
+- - -
+
+#### `tf.DType.is_numpy_compatible` {#DType.is_numpy_compatible}
 
 
 

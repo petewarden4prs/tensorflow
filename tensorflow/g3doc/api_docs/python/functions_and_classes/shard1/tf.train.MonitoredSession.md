@@ -31,6 +31,7 @@ Run: When `run()` is called, the monitored session does following things:
 
 
 Exit: At the `close()`, the monitored session does following things in order:
+
 * calls `hook.end()`
 * closes the queue runners and the session
 * surpresses `OutOfRange` error which indicates that all inputs have been
@@ -47,6 +48,7 @@ How to set `tf.Session` arguments:
   MonitoredSession(
     session_creator=WorkerSessionCreator(master=..., config=...))
   ```
+See `MonitoredTrainingSession` for an example usage based on chief or worker.
 - - -
 
 #### `tf.train.MonitoredSession.__enter__()` {#MonitoredSession.__enter__}

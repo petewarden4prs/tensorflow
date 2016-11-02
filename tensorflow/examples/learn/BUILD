@@ -19,6 +19,13 @@ py_binary(
 )
 
 py_binary(
+    name = "hdf5_classification",
+    srcs = ["hdf5_classification.py"],
+    srcs_version = "PY2AND3",
+    deps = ["//tensorflow:tensorflow_py"],
+)
+
+py_binary(
     name = "iris",
     srcs = ["iris.py"],
     srcs_version = "PY2AND3",
@@ -81,6 +88,15 @@ py_binary(
     deps = [
         "//tensorflow:tensorflow_py",
         "//tensorflow/examples/tutorials/mnist:input_data",
+    ],
+)
+
+py_binary(
+    name = "resnet",
+    srcs = ["resnet.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        "//tensorflow:tensorflow_py",
     ],
 )
 
@@ -153,6 +169,7 @@ sh_test(
         ":iris_val_based_early_stopping",
         ":iris_with_pipeline",
         ":random_forest_mnist",
+        ":resnet",
         ":text_classification",
         ":text_classification_builtin_rnn_model",
         ":text_classification_character_cnn",
@@ -160,7 +177,10 @@ sh_test(
         ":text_classification_cnn",
         ":wide_n_deep_tutorial",
     ],
-    tags = ["manual"],
+    tags = [
+        "manual",
+        "notap",
+    ],
 )
 
 filegroup(

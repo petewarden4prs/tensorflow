@@ -60,7 +60,7 @@ Input of `fit` and `evaluate` should have following features,
     whose `value` is a `Tensor`.
 - - -
 
-#### `tf.contrib.learn.LinearClassifier.__init__(feature_columns, model_dir=None, n_classes=2, weight_column_name=None, optimizer=None, gradient_clip_norm=None, enable_centered_bias=None, _joint_weight=False, config=None, feature_engineering_fn=None)` {#LinearClassifier.__init__}
+#### `tf.contrib.learn.LinearClassifier.__init__(feature_columns, model_dir=None, n_classes=2, weight_column_name=None, optimizer=None, gradient_clip_norm=None, enable_centered_bias=False, _joint_weight=False, config=None, feature_engineering_fn=None)` {#LinearClassifier.__init__}
 
 Construct a `LinearClassifier` estimator object.
 
@@ -73,7 +73,7 @@ Construct a `LinearClassifier` estimator object.
 *  <b>`model_dir`</b>: Directory to save model parameters, graph and etc. This can
     also be used to load checkpoints from the directory into a estimator
     to continue training a previously saved model.
-*  <b>`n_classes`</b>: number of target classes. Default is binary classification.
+*  <b>`n_classes`</b>: number of label classes. Default is binary classification.
 *  <b>`weight_column_name`</b>: A string defining feature column name representing
     weights. It is used to down weight or boost examples during training. It
     will be multiplied by the loss of the example.
@@ -93,8 +93,8 @@ Construct a `LinearClassifier` estimator object.
 
 *  <b>`config`</b>: `RunConfig` object to configure the runtime settings.
 *  <b>`feature_engineering_fn`</b>: Feature engineering function. Takes features and
-                    targets which are the output of `input_fn` and
-                    returns features and targets which will be fed
+                    labels which are the output of `input_fn` and
+                    returns features and labels which will be fed
                     into the model.
 
 ##### Returns:
@@ -176,16 +176,28 @@ See trainable.Trainable.
 
 - - -
 
-#### `tf.contrib.learn.LinearClassifier.predict(x=None, input_fn=None, batch_size=None, as_iterable=False)` {#LinearClassifier.predict}
+#### `tf.contrib.learn.LinearClassifier.predict(*args, **kwargs)` {#LinearClassifier.predict}
 
-Runs inference to determine the predicted class.
+Runs inference to determine the predicted class. (deprecated arguments)
+
+SOME ARGUMENTS ARE DEPRECATED. They will be removed after 2016-09-15.
+Instructions for updating:
+The default behavior of predict() is changing. The default value for
+as_iterable will change to True, and then the flag will be removed
+altogether. The behavior of this flag is described below.
 
 
 - - -
 
-#### `tf.contrib.learn.LinearClassifier.predict_proba(x=None, input_fn=None, batch_size=None, outputs=None, as_iterable=False)` {#LinearClassifier.predict_proba}
+#### `tf.contrib.learn.LinearClassifier.predict_proba(*args, **kwargs)` {#LinearClassifier.predict_proba}
 
-Runs inference to determine the class probability predictions.
+Runs inference to determine the class probability predictions. (deprecated arguments)
+
+SOME ARGUMENTS ARE DEPRECATED. They will be removed after 2016-09-15.
+Instructions for updating:
+The default behavior of predict() is changing. The default value for
+as_iterable will change to True, and then the flag will be removed
+altogether. The behavior of this flag is described below.
 
 
 - - -

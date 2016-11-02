@@ -20,6 +20,7 @@ from __future__ import division
 from __future__ import print_function
 
 import abc
+import collections
 import copy
 import inspect
 import itertools
@@ -35,13 +36,13 @@ from tensorflow.contrib import layers
 from tensorflow.contrib import metrics as metrics_lib
 from tensorflow.contrib.framework import deprecated
 from tensorflow.contrib.framework import deprecated_arg_values
+from tensorflow.contrib.framework import get_graph_from_inputs
 from tensorflow.contrib.framework import list_variables
 from tensorflow.contrib.framework import load_variable
 from tensorflow.contrib.learn.python.learn import evaluable
 from tensorflow.contrib.learn.python.learn import graph_actions
 from tensorflow.contrib.learn.python.learn import metric_spec
 from tensorflow.contrib.learn.python.learn import monitors as monitor_lib
-from tensorflow.contrib.learn.python.learn import session_run_hook
 from tensorflow.contrib.learn.python.learn import trainable
 from tensorflow.contrib.learn.python.learn.estimators import _sklearn as sklearn
 from tensorflow.contrib.learn.python.learn.estimators import run_config
@@ -53,10 +54,13 @@ from tensorflow.contrib.learn.python.learn.utils import export
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import random_seed
+from tensorflow.python.framework import tensor_shape
+from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.training import device_setter
 from tensorflow.python.training import saver
+from tensorflow.python.training import session_run_hook
 
 
 AS_ITERABLE_DATE = '2016-09-15'
@@ -79,6 +83,68 @@ class ModeKeys(object):
   TRAIN = 'train'
   EVAL = 'eval'
   INFER = 'infer'
+
+
+class ModelFnOps(
+    collections.namedtuple('ModelFnOps', ['predictions', 'loss', 'training_op',
+                                          'default_metrics', 'signature_fn'])):
+
+  def __new__(cls, mode, predictions=None, loss=None, training_op=None,
+              default_metrics=None, signature_fn=None):
+    # Assert all ops are from the same graph.
+    get_graph_from_inputs((predictions, loss, training_op))
+
+    # Validate training_op.
+    if training_op is None:
+      if mode == ModeKeys.TRAIN:
+        raise ValueError('Missing training_op.')
+    elif not isinstance(training_op, ops.Operation):
+      # TODO(ptucker): Should this be allowed? Consider raising error.
+      training_op = ops.convert_to_tensor(training_op).op
+
+    # Validate loss.
+    if loss is None:
+      if mode in (ModeKeys.TRAIN, ModeKeys.EVAL):
+        raise ValueError('Missing loss.')
+    else:
+      loss = ops.convert_to_tensor(loss)
+      loss_shape = loss.get_shape()
+      if loss_shape.num_elements() not in (None, 1):
+        raise ValueError('Loss must be scalar: %s.' % loss)
+      if not loss_shape.is_compatible_with(tensor_shape.scalar()):
+        loss = array_ops.reshape(loss, [])
+
+    # Validate predictions.
+    if predictions is None:
+      if mode == ModeKeys.INFER or mode == ModeKeys.EVAL:
+        raise ValueError('Missing predictions.')
+    else:
+      if isinstance(predictions, dict):
+        predictions = {
+            k: contrib_framework.convert_to_tensor_or_sparse_tensor(v)
+            for k, v in six.iteritems(predictions)
+        }
+      else:
+        predictions = contrib_framework.convert_to_tensor_or_sparse_tensor(
+            predictions)
+
+    # Validate default_metrics
+    if default_metrics is None:
+      default_metrics = {}
+    else:
+      if not isinstance(default_metrics, dict):
+        raise ValueError('default_metrics must be a dict.')
+      for k, v in default_metrics.items():
+        if not isinstance(v, metric_spec.MetricSpec):
+          raise ValueError('Metric with key=%s is not MetricSpec' % k)
+
+    # validate signature_fn
+    if signature_fn:
+      if not callable(signature_fn):
+        raise ValueError('signature_fn is not callable.')
+
+    return super(ModelFnOps, cls).__new__(cls, predictions, loss, training_op,
+                                          default_metrics, signature_fn)
 
 
 def _get_input_fn(x, y, input_fn, feed_fn, batch_size, shuffle=False, epochs=1):
@@ -118,7 +184,7 @@ def infer_real_valued_columns_from_input_fn(input_fn):
   Args:
     input_fn: Input function returning a tuple of:
         features - Dictionary of string feature name to `Tensor` or `Tensor`.
-        target - `Tensor` of target objects.
+        labels - `Tensor` of label values.
 
   Returns:
     List of `FeatureColumn` objects.
@@ -167,8 +233,10 @@ def _get_replica_device_setter(config):
   Returns:
     A replica device setter, or None.
   """
-  ps_ops = ['Variable', 'AutoReloadVariable',
-            'MutableHashTable', 'MutableHashTableOfTensors']
+  ps_ops = [
+      'Variable', 'AutoReloadVariable', 'MutableHashTable',
+      'MutableHashTableOfTensors', 'MutableDenseHashTable'
+  ]
 
   if config.job_name:
     worker_device = '/job:%s/task:%d' % (config.job_name, config.task)
@@ -183,14 +251,14 @@ def _get_replica_device_setter(config):
     return None
 
 
-def _make_metrics_ops(metrics, features, targets, predictions):
-  """Add metrics to run on features, targets, and predictions dicts or tensors.
+def _make_metrics_ops(metrics, features, labels, predictions):
+  """Add metrics based on `features`, `labels`, and `predictions`.
 
   `metrics` contains a specification for how to run metrics. It is a dict
   mapping friendly names to either `MetricSpec` objects, or directly to a metric
-  function (assuming that predictions and targets are single tensors), or to
-  a `(pred_name, metric)` tuples, which passes `predictions[pred_name]` and
-  targets to `metric` (assuming targets is a single tensor).
+  function (assuming that `predictions` and `labels` are single tensors), or to
+  `(pred_name, metric)` `tuple`, which passes `predictions[pred_name]` and
+  `labels` to `metric` (assuming `labels` is a single tensor).
 
   Users are encouraged to use `MetricSpec` objects, which are more flexible and
   cleaner. They also lead to clearer errors.
@@ -199,7 +267,7 @@ def _make_metrics_ops(metrics, features, targets, predictions):
     metrics: A dict mapping names to metrics specification, for example
       `MetricSpec` objects.
     features: A dict of tensors returned from an input_fn as features/inputs.
-    targets: A single tensor or a dict of tensors returned from an input_fn as
+    labels: A single tensor or a dict of tensors returned from an input_fn as
       labels.
     predictions: A single tensor or a dict of tensors output from a model as
       predictions.
@@ -210,17 +278,20 @@ def _make_metrics_ops(metrics, features, targets, predictions):
 
   Raises:
     ValueError: If metrics specifications do not work with the type of
-      features/targets/predictions provided. Mostly, a dict is given but no
-      pred_name specified.
+      `features`, `labels`, or `predictions` provided. Mostly, a dict is given
+      but no pred_name specified.
   """
   metrics = metrics or {}
-  if isinstance(targets, dict) and len(targets) == 1:
-    # Unpack single target into just tensor.
-    targets = targets[list(targets.keys())[0]]
+
+  # If labels is a dict with a single key, unpack into a single tensor.
+  labels_tensor_or_dict = labels
+  if isinstance(labels, dict) and len(labels) == 1:
+    labels_tensor_or_dict = labels[list(labels.keys())[0]]
+
   result = {}
   for name, metric in six.iteritems(metrics):
     if isinstance(metric, metric_spec.MetricSpec):
-      result[name] = metric.create_metric_ops(features, targets, predictions)
+      result[name] = metric.create_metric_ops(features, labels, predictions)
       continue
 
     # TODO(b/31229024): Remove the rest of this loop
@@ -230,26 +301,29 @@ def _make_metrics_ops(metrics, features, targets, predictions):
 
     if isinstance(name, tuple):
       # Multi-head metrics.
+      if len(name) != 2:
+        raise ValueError('Invalid metric for {}. It returned a tuple with '
+                         'len {}, expected 2.'.format(name, len(name)))
       if not isinstance(predictions, dict):
         raise ValueError(
             'Metrics passed provide (name, prediction), '
             'but predictions are not dict. '
             'Metrics: %s, Predictions: %s.' % (metrics, predictions))
-      # Here are two options: targets are single Tensor or a dict.
-      if isinstance(targets, dict) and name[1] in targets:
-        # If targets are dict and the prediction name is in it, apply metric.
-        result[name[0]] = metric(predictions[name[1]], targets[name[1]])
+      # Here are two options: labels are single Tensor or a dict.
+      if isinstance(labels, dict) and name[1] in labels:
+        # If labels are dict and the prediction name is in it, apply metric.
+        result[name[0]] = metric(predictions[name[1]], labels[name[1]])
       else:
-        # Otherwise pass the targets to the metric.
-        result[name[0]] = metric(predictions[name[1]], targets)
+        # Otherwise pass the labels to the metric.
+        result[name[0]] = metric(predictions[name[1]], labels_tensor_or_dict)
     else:
       # Single head metrics.
       if isinstance(predictions, dict):
         raise ValueError(
             'Metrics passed provide only name, no prediction, '
             'but predictions are dict. '
-            'Metrics: %s, Targets: %s.' % (metrics, targets))
-      result[name] = metric(predictions, targets)
+            'Metrics: %s, Labels: %s.' % (metrics, labels_tensor_or_dict))
+      result[name] = metric(predictions, labels_tensor_or_dict)
   return result
 
 
@@ -288,10 +362,10 @@ class BaseEstimator(
       logging.warning('Using temporary folder as model directory: %s',
                       self._model_dir)
 
-    # Create a run configuration
+    # Create a run configuration.
     if config is None:
       self._config = BaseEstimator._Config()
-      logging.warning('Using default config.')
+      logging.info('Using default config.')
     else:
       self._config = config
     logging.info('Using config: %s', str(vars(self._config)))
@@ -299,10 +373,10 @@ class BaseEstimator(
     # Set device function depending if there are replicas or not.
     self._device_fn = _get_replica_device_setter(self._config)
 
-    # Features and targets TensorSignature objects.
+    # Features and labels TensorSignature objects.
     # TODO(wicke): Rename these to something more descriptive
     self._features_info = None
-    self._targets_info = None
+    self._labels_info = None
 
     self._graph = None
 
@@ -352,7 +426,7 @@ class BaseEstimator(
          returns arrays of features. The training input samples for fitting the
          model. If set, `input_fn` must be `None`.
       y: Vector or matrix [n_samples] or [n_samples, n_outputs]. Can be
-         iterator that returns array of targets. The training target values
+         iterator that returns array of labels. The training label values
          (class labels in classification, real numbers in regression). If set,
          `input_fn` must be `None`.
       input_fn: Input function. If set, `x`, `y`, and `batch_size` must be
@@ -371,7 +445,7 @@ class BaseEstimator(
           provided.
     """
     logging.warning('The current implementation of partial_fit is not optimized'
-                    'for use in a loop. Consider using fit() instead.')
+                    ' for use in a loop. Consider using fit() instead.')
     return self.fit(x=x, y=y, input_fn=input_fn, steps=steps,
                     batch_size=batch_size, monitors=monitors)
 
@@ -405,7 +479,7 @@ class BaseEstimator(
       AS_ITERABLE_DATE, AS_ITERABLE_INSTRUCTIONS, as_iterable=False)
   def predict(
       self, x=None, input_fn=None, batch_size=None, outputs=None,
-      as_iterable=False):
+      as_iterable=True):
     """Returns predictions for given features.
 
     Args:
@@ -487,11 +561,11 @@ class BaseEstimator(
       input_fn: If `use_deprecated_input_fn` is true, then a function that given
         `Tensor` of `Example` strings, parses it into features that are then
         passed to the model. Otherwise, a function that takes no argument and
-        returns a tuple of (features, targets), where features is a dict of
-        string key to `Tensor` and targets is a `Tensor` that's currently not
+        returns a tuple of (features, labels), where features is a dict of
+        string key to `Tensor` and labels is a `Tensor` that's currently not
         used (and so can be `None`).
       input_feature_key: Only used if `use_deprecated_input_fn` is false. String
-        key into the features dict returned by `input_fn` that corresponds toa 
+        key into the features dict returned by `input_fn` that corresponds to a
         the raw `Example` strings `Tensor` that the exported model will take as
         input. Can only be `None` if you're using a custom `signature_fn` that
         does not use the first arg (examples).
@@ -526,14 +600,14 @@ class BaseEstimator(
     # pylint: enable=protected-access
 
   @abc.abstractproperty
-  def _get_train_ops(self, features, targets):
+  def _get_train_ops(self, features, labels):
     """Method that builds model graph and returns trainer ops.
 
     Expected to be overriden by sub-classes that require custom support.
 
     Args:
       features: `Tensor` or `dict` of `Tensor` objects.
-      targets: `Tensor` or `dict` of `Tensor` objects.
+      labels: `Tensor` or `dict` of `Tensor` objects.
 
     Returns:
       Tuple of train `Operation` and loss `Tensor`.
@@ -552,18 +626,18 @@ class BaseEstimator(
     """
     pass
 
-  def _get_eval_ops(self, features, targets, metrics):
+  def _get_eval_ops(self, features, labels, metrics):
     """Method that builds model graph and returns evaluation ops.
 
     Expected to be overriden by sub-classes that require custom support.
 
     Args:
       features: `Tensor` or `dict` of `Tensor` objects.
-      targets: `Tensor` or `dict` of `Tensor` objects.
+      labels: `Tensor` or `dict` of `Tensor` objects.
       metrics: Dict of metrics to run. If None, the default metric functions
         are used; if {}, no metrics are used. Otherwise, `metrics` should map
         friendly names for the metric to a `MetricSpec` object defining which
-        model outputs to evaluate against which targets with which metric
+        model outputs to evaluate against which labels with which metric
         function. Metric ops should support streaming, e.g., returning
         update_op and value tensors. See more details in
         `../../../../metrics/python/metrics/ops/streaming_metrics.py` and
@@ -600,28 +674,28 @@ class BaseEstimator(
     return tensor_signature.create_example_parser_from_signatures(
         self._features_info, examples_batch)
 
-  def _check_inputs(self, features, targets):
+  def _check_inputs(self, features, labels):
     if self._features_info is not None:
-      logging.warning('Given features: %s, required signatures: %s.',
-                      str(features), str(self._features_info))
+      logging.debug('Given features: %s, required signatures: %s.',
+                    str(features), str(self._features_info))
       if not tensor_signature.tensors_compatible(features, self._features_info):
         raise ValueError('Features are incompatible with given information. '
                          'Given features: %s, required signatures: %s.' %
                          (str(features), str(self._features_info)))
     else:
       self._features_info = tensor_signature.create_signatures(features)
-      logging.info('Setting feature info to %s', str(self._features_info))
-    if targets is not None:
-      if self._targets_info is not None:
-        logging.warning('Given targets: %s, required signatures: %s.',
-                        str(targets), str(self._targets_info))
-        if not tensor_signature.tensors_compatible(targets, self._targets_info):
-          raise ValueError('Targets are incompatible with given information. '
-                           'Given targets: %s, required signatures: %s.' %
-                           (str(targets), str(self._targets_info)))
+      logging.debug('Setting feature info to %s.', str(self._features_info))
+    if labels is not None:
+      if self._labels_info is not None:
+        logging.debug('Given labels: %s, required signatures: %s.',
+                      str(labels), str(self._labels_info))
+        if not tensor_signature.tensors_compatible(labels, self._labels_info):
+          raise ValueError('Labels are incompatible with given information. '
+                           'Given labels: %s, required signatures: %s.' %
+                           (str(labels), str(self._labels_info)))
       else:
-        self._targets_info = tensor_signature.create_signatures(targets)
-        logging.info('Setting targets info to %s', str(self._targets_info))
+        self._labels_info = tensor_signature.create_signatures(labels)
+        logging.debug('Setting labels info to %s', str(self._labels_info))
 
   def _train_model(self,
                    input_fn,
@@ -657,9 +731,9 @@ class BaseEstimator(
     with self._graph.as_default() as g, g.device(device_fn):
       random_seed.set_random_seed(self._config.tf_random_seed)
       global_step = contrib_framework.create_global_step(g)
-      features, targets = input_fn()
-      self._check_inputs(features, targets)
-      train_op, loss_op = self._get_train_ops(features, targets)
+      features, labels = input_fn()
+      self._check_inputs(features, labels)
+      train_op, loss_op = self._get_train_ops(features, labels)
 
       # Add default monitors.
       if monitors is None:
@@ -686,6 +760,7 @@ class BaseEstimator(
       if deprecated_monitors:
         hooks.append(monitor_lib.RunHookAdapterForMonitors(deprecated_monitors))
 
+      ops.add_to_collection(ops.GraphKeys.LOSSES, loss_op)
       return graph_actions._monitored_train(  # pylint: disable=protected-access
           graph=g,
           output_dir=self._model_dir,
@@ -756,9 +831,9 @@ class BaseEstimator(
     with ops.Graph().as_default() as g:
       random_seed.set_random_seed(self._config.tf_random_seed)
       global_step = contrib_framework.create_global_step(g)
-      features, targets = input_fn()
-      self._check_inputs(features, targets)
-      eval_dict = self._get_eval_ops(features, targets, metrics)
+      features, labels = input_fn()
+      self._check_inputs(features, labels)
+      eval_dict = self._get_eval_ops(features, labels, metrics)
       update_op, eval_dict = self._extract_metric_update_ops(eval_dict)
       eval_results, current_global_step = graph_actions.evaluate(
           graph=g,
@@ -780,7 +855,7 @@ class BaseEstimator(
     return result
 
   def _infer_model(
-      self, input_fn, feed_fn=None, outputs=None, as_iterable=False):
+      self, input_fn, feed_fn=None, outputs=None, as_iterable=True):
     # Check that model has been trained.
     checkpoint_path = saver.latest_checkpoint(self._model_dir)
     if not checkpoint_path:
@@ -864,8 +939,8 @@ class BaseEstimator(
       logging.info('Reached end of inputs for predict_iter.')
 
 
-def _identity_feature_engineering_fn(features, targets):
-  return features, targets
+def _identity_feature_engineering_fn(features, labels):
+  return features, labels
 
 
 class Estimator(BaseEstimator):
@@ -881,23 +956,30 @@ class Estimator(BaseEstimator):
     """Constructs an Estimator instance.
 
     Args:
-      model_fn: Model function, takes features and targets tensors or dicts of
-                tensors and returns predictions and loss tensors.
-                Supports next three signatures for the function:
+      model_fn: Model function, takes features and labels tensors or dicts of
+                tensors and returns tuple of:
 
-          * `(features, targets) -> (predictions, loss, train_op)`
-          * `(features, targets, mode) -> (predictions, loss, train_op)`
-          * `(features, targets, mode, params) -> (predictions, loss, train_op)`
+          * predictions: `Tensor`, `SparseTensor` or dictionary of same.
+              Can also be any type that is convertible to a `Tensor` or
+              `SparseTensor`, or dictionary of same.
+          * loss: Scalar loss `Tensor`.
+          * train_op: Training update `Tensor` or `Operation`.
+
+         Supports next three signatures for the function:
+
+          * `(features, labels) -> (predictions, loss, train_op)`
+          * `(features, labels, mode) -> (predictions, loss, train_op)`
+          * `(features, labels, mode, params) -> (predictions, loss, train_op)`
 
         Where
 
           * `features` are single `Tensor` or `dict` of `Tensor`s
                  (depending on data passed to `fit`),
-          * `targets` are `Tensor` or `dict` of `Tensor`s (for multi-head
-                 models). If mode is `ModeKeys.INFER`, `targets=None` will be
+          * `labels` are `Tensor` or `dict` of `Tensor`s (for multi-head
+                 models). If mode is `ModeKeys.INFER`, `labels=None` will be
                  passed. If the `model_fn`'s signature does not accept
                  `mode`, the `model_fn` must still be able to handle
-                 `targets=None`.
+                 `labels=None`.
           * `mode` represents if this training, evaluation or
                  prediction. See `ModeKeys`.
           * `params` is a `dict` of hyperparameters. Will receive what
@@ -911,10 +993,10 @@ class Estimator(BaseEstimator):
       params: `dict` of hyper parameters that will be passed into `model_fn`.
               Keys are names of parameters, values are basic python types.
       feature_engineering_fn: Feature engineering function. Takes features and
-                              targets which are the output of `input_fn` and
-                              returns features and targets which will be fed
+                              labels which are the output of `input_fn` and
+                              returns features and labels which will be fed
                               into `model_fn`. Please check `model_fn` for
-                              a definition of features and targets.
+                              a definition of features and labels.
 
     Raises:
       ValueError: parameters of `model_fn` don't match `params`.
@@ -928,7 +1010,7 @@ class Estimator(BaseEstimator):
                          'arguments, but not None params (%s) are passed.' %
                          (model_fn, params))
       if params is None and 'params' in model_fn_args:
-        logging.warning('Estimator\'s model_fn (%s) has includes params '
+        logging.warning('Estimator\'s model_fn (%s) includes params '
                         'argument, but params are not passed to Estimator.',
                         model_fn)
     self._model_fn = model_fn
@@ -936,18 +1018,46 @@ class Estimator(BaseEstimator):
     self._feature_engineering_fn = (
         feature_engineering_fn or _identity_feature_engineering_fn)
 
-  def _call_model_fn(self, features, targets, mode):
-    """Calls model function with support of 2, 3 or 4 arguments."""
-    features, targets = self._feature_engineering_fn(features, targets)
+  def _call_model_fn(self, features, labels, mode):
+    """Calls model function with support of 2, 3 or 4 arguments.
+
+    Args:
+      features: features dict.
+      labels: labels dict.
+      mode: ModeKeys
+
+    Returns:
+      A ModelFnOps object. If model_fn returns a tuple, wraps them up in a
+      ModelFnOps object.
+
+    Raises:
+      ValueError: if model_fn returns invalid objects.
+    """
+    features, labels = self._feature_engineering_fn(features, labels)
     model_fn_args = _get_arguments(self._model_fn)
     if 'mode' in model_fn_args:
       if 'params' in model_fn_args:
-        return self._model_fn(features, targets, mode=mode, params=self.params)
+        model_fn_results = self._model_fn(features, labels, mode=mode,
+                                          params=self.params)
       else:
-        return self._model_fn(features, targets, mode=mode)
-    return self._model_fn(features, targets)
+        model_fn_results = self._model_fn(features, labels, mode=mode)
+    else:
+      model_fn_results = self._model_fn(features, labels)
 
-  def _get_train_ops(self, features, targets):
+    if isinstance(model_fn_results, ModelFnOps):
+      return model_fn_results
+
+    # Here model_fn_ops should be a tuple with 3 elements.
+    if len(model_fn_results) != 3:
+      raise ValueError('Unrecognized value returned by model_fn, '
+                       'please return ModelFnOps.')
+    return ModelFnOps(
+        mode=mode,
+        predictions=model_fn_results[0],
+        loss=model_fn_results[1],
+        training_op=model_fn_results[2])
+
+  def _get_train_ops(self, features, labels):
     """Method that builds model graph and returns trainer ops.
 
     Expected to be overriden by sub-classes that require custom support.
@@ -956,15 +1066,15 @@ class Estimator(BaseEstimator):
 
     Args:
       features: `Tensor` or `dict` of `Tensor` objects.
-      targets: `Tensor` or `dict` of `Tensor` objects.
+      labels: `Tensor` or `dict` of `Tensor` objects.
 
     Returns:
       Tuple of train `Operation` and loss `Tensor`.
     """
-    _, loss, train_op = self._call_model_fn(features, targets, ModeKeys.TRAIN)
-    return train_op, loss
+    model_fn_ops = self._call_model_fn(features, labels, ModeKeys.TRAIN)
+    return model_fn_ops.training_op, model_fn_ops.loss
 
-  def _get_eval_ops(self, features, targets, metrics):
+  def _get_eval_ops(self, features, labels, metrics):
     """Method that builds model graph and returns evaluation ops.
 
     Expected to be overriden by sub-classes that require custom support.
@@ -973,11 +1083,11 @@ class Estimator(BaseEstimator):
 
     Args:
       features: `Tensor` or `dict` of `Tensor` objects.
-      targets: `Tensor` or `dict` of `Tensor` objects.
+      labels: `Tensor` or `dict` of `Tensor` objects.
       metrics: Dict of metrics to run. If None, the default metric functions
         are used; if {}, no metrics are used. Otherwise, `metrics` should map
         friendly names for the metric to a `MetricSpec` object defining which
-        model outputs to evaluate against which targets with which metric
+        model outputs to evaluate against which labels with which metric
         function. Metric ops should support streaming, e.g., returning
         update_op and value tensors. See more details in
         `../../../../metrics/python/metrics/ops/streaming_metrics.py` and
@@ -987,11 +1097,19 @@ class Estimator(BaseEstimator):
       metrics: `dict` of `Tensor` objects.
 
     Raises:
-      ValueError: if `metrics` don't match `targets`.
+      ValueError: if `metrics` don't match `labels`.
     """
-    predictions, loss, _ = self._call_model_fn(features, targets, ModeKeys.EVAL)
-    result = {'loss': metrics_lib.streaming_mean(loss)}
-    result.update(_make_metrics_ops(metrics, features, targets, predictions))
+    model_fn_ops = self._call_model_fn(features, labels, ModeKeys.EVAL)
+
+    all_metrics = model_fn_ops.default_metrics
+    # Custom metrics should overwrite defaults.
+    if metrics:
+      all_metrics.update(metrics)
+
+    result = _make_metrics_ops(all_metrics, features, labels,
+                               model_fn_ops.predictions)
+    if 'loss' not in result:
+      result['loss'] = metrics_lib.streaming_mean(model_fn_ops.loss)
     return result
 
   def _get_predict_ops(self, features):
@@ -1007,7 +1125,8 @@ class Estimator(BaseEstimator):
     Returns:
       predictions: `Tensor` or `dict` of `Tensor` objects.
     """
-    targets = tensor_signature.create_placeholders_from_signatures(
-        self._targets_info)
-    predictions, _, _ = self._call_model_fn(features, targets, ModeKeys.INFER)
-    return predictions
+    labels = tensor_signature.create_placeholders_from_signatures(
+        self._labels_info)
+    model_fn_ops = self._call_model_fn(features, labels, ModeKeys.INFER)
+    return model_fn_ops.predictions
+

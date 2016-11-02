@@ -19,6 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import threading
+import weakref
 
 from tensorflow.core.protobuf import queue_runner_pb2
 from tensorflow.python.framework import errors
@@ -45,7 +46,7 @@ class QueueRunner(object):
 
   def __init__(self, queue=None, enqueue_ops=None, close_op=None,
                cancel_op=None, queue_closed_exception_types=None,
-               queue_runner_def=None):
+               queue_runner_def=None, import_scope=None):
     """Create a QueueRunner.
 
     On construction the `QueueRunner` adds an op to close the queue.  That op
@@ -70,6 +71,8 @@ class QueueRunner(object):
       queue_runner_def: Optional `QueueRunnerDef` protocol buffer. If specified,
         recreates the QueueRunner from its contents. `queue_runner_def` and the
         other arguments are mutually exclusive.
+      import_scope: Optional `string`. Name scope to add. Only used when
+        initializing from protocol buffer.
 
     Raises:
       ValueError: If both `queue_runner_def` and `queue` are both specified.
@@ -79,7 +82,8 @@ class QueueRunner(object):
     if queue_runner_def:
       if queue or enqueue_ops:
         raise ValueError("queue_runner_def and queue are mutually exclusive.")
-      self._init_from_proto(queue_runner_def)
+      self._init_from_proto(queue_runner_def,
+                            import_scope=import_scope)
     else:
       self._init_from_args(
           queue=queue, enqueue_ops=enqueue_ops,
@@ -87,7 +91,9 @@ class QueueRunner(object):
           queue_closed_exception_types=queue_closed_exception_types)
     # Protect the count of runs to wait for.
     self._lock = threading.Lock()
-    self._runs = 0
+    # A map from a session object to the number of outstanding queue runner
+    # threads for that session.
+    self._runs_per_session = weakref.WeakKeyDictionary()
     # List of exceptions raised by the running threads.
     self._exceptions_raised = []
 
@@ -139,19 +145,24 @@ class QueueRunner(object):
       self._queue_closed_exception_types = tuple(
           self._queue_closed_exception_types)
 
-  def _init_from_proto(self, queue_runner_def):
+  def _init_from_proto(self, queue_runner_def, import_scope=None):
     """Create a QueueRunner from `QueueRunnerDef`.
 
     Args:
       queue_runner_def: Optional `QueueRunnerDef` protocol buffer.
+      import_scope: Optional `string`. Name scope to add.
     """
     assert isinstance(queue_runner_def, queue_runner_pb2.QueueRunnerDef)
     g = ops.get_default_graph()
-    self._queue = g.as_graph_element(queue_runner_def.queue_name)
-    self._enqueue_ops = [g.as_graph_element(op) for op
-                         in queue_runner_def.enqueue_op_name]
-    self._close_op = g.as_graph_element(queue_runner_def.close_op_name)
-    self._cancel_op = g.as_graph_element(queue_runner_def.cancel_op_name)
+    self._queue = g.as_graph_element(
+        ops.prepend_name_scope(queue_runner_def.queue_name, import_scope))
+    self._enqueue_ops = [g.as_graph_element(
+        ops.prepend_name_scope(op, import_scope))
+                         for op in queue_runner_def.enqueue_op_name]
+    self._close_op = g.as_graph_element(ops.prepend_name_scope(
+        queue_runner_def.close_op_name, import_scope))
+    self._cancel_op = g.as_graph_element(ops.prepend_name_scope(
+        queue_runner_def.cancel_op_name, import_scope))
     self._queue_closed_exception_types = tuple(
         errors.exception_type_from_error_code(code)
         for code in queue_runner_def.queue_closed_exception_types)
@@ -226,9 +237,9 @@ class QueueRunner(object):
         except self._queue_closed_exception_types:  # pylint: disable=catching-non-exception
           # This exception indicates that a queue was closed.
           with self._lock:
-            self._runs -= 1
+            self._runs_per_session[sess] -= 1
             decremented = True
-            if self._runs == 0:
+            if self._runs_per_session[sess] == 0:
               try:
                 sess.run(self._close_op)
               except Exception as e:
@@ -248,7 +259,7 @@ class QueueRunner(object):
       # Make sure we account for all terminations: normal or errors.
       if not decremented:
         with self._lock:
-          self._runs -= 1
+          self._runs_per_session[sess] -= 1
 
   def _close_on_stop(self, sess, cancel_op, coord):
     """Close the queue when the Coordinator requests stop.
@@ -268,19 +279,19 @@ class QueueRunner(object):
   # pylint: enable=broad-except
 
   def create_threads(self, sess, coord=None, daemon=False, start=False):
-    """Create threads to run the enqueue ops.
+    """Create threads to run the enqueue ops for the given session.
 
     This method requires a session in which the graph was launched.  It creates
     a list of threads, optionally starting them.  There is one thread for each
     op passed in `enqueue_ops`.
 
-    The `coord` argument is an optional coordinator, that the threads will use
+    The `coord` argument is an optional coordinator that the threads will use
     to terminate together and report exceptions.  If a coordinator is given,
     this method starts an additional thread to close the queue when the
     coordinator requests a stop.
 
-    This method may be called again as long as all threads from a previous call
-    have stopped.
+    If previously created threads for the given session are still running, no
+    new threads will be created.
 
     Args:
       sess: A `Session`.
@@ -292,16 +303,16 @@ class QueueRunner(object):
 
     Returns:
       A list of threads.
-
-    Raises:
-      RuntimeError: If threads from a previous call to `create_threads()` are
-      still running.
     """
     with self._lock:
-      if self._runs > 0:
-        # Already started: no new threads to return.
-        return []
-      self._runs = len(self._enqueue_ops)
+      try:
+        if self._runs_per_session[sess] > 0:
+          # Already started: no new threads to return.
+          return []
+      except KeyError:
+        # We haven't seen this session yet.
+        pass
+      self._runs_per_session[sess] = len(self._enqueue_ops)
       self._exceptions_raised = []
 
     ret_threads = [threading.Thread(target=self._run, args=(sess, op, coord))
@@ -316,27 +327,40 @@ class QueueRunner(object):
         t.start()
     return ret_threads
 
-  def to_proto(self):
+  def to_proto(self, export_scope=None):
     """Converts this `QueueRunner` to a `QueueRunnerDef` protocol buffer.
 
+    Args:
+      export_scope: Optional `string`. Name scope to remove.
+
     Returns:
-      A `QueueRunnerDef` protocol buffer.
+      A `QueueRunnerDef` protocol buffer, or `None` if the `Variable` is not in
+      the specified name scope.
     """
-    queue_runner_def = queue_runner_pb2.QueueRunnerDef()
-    queue_runner_def.queue_name = self.queue.name
-    for enqueue_op in self.enqueue_ops:
-      queue_runner_def.enqueue_op_name.append(enqueue_op.name)
-    queue_runner_def.close_op_name = self.close_op.name
-    queue_runner_def.cancel_op_name = self.cancel_op.name
-    queue_runner_def.queue_closed_exception_types.extend([
-        errors.error_code_from_exception_type(cls)
-        for cls in self._queue_closed_exception_types])
-    return queue_runner_def
+    if (export_scope is None or
+        self.queue.name.startswith(export_scope)):
+      queue_runner_def = queue_runner_pb2.QueueRunnerDef()
+      queue_runner_def.queue_name = ops.strip_name_scope(
+          self.queue.name, export_scope)
+      for enqueue_op in self.enqueue_ops:
+        queue_runner_def.enqueue_op_name.append(
+            ops.strip_name_scope(enqueue_op.name, export_scope))
+      queue_runner_def.close_op_name = ops.strip_name_scope(
+          self.close_op.name, export_scope)
+      queue_runner_def.cancel_op_name = ops.strip_name_scope(
+          self.cancel_op.name, export_scope)
+      queue_runner_def.queue_closed_exception_types.extend([
+          errors.error_code_from_exception_type(cls)
+          for cls in self._queue_closed_exception_types])
+      return queue_runner_def
+    else:
+      return None
 
   @staticmethod
-  def from_proto(queue_runner_def):
+  def from_proto(queue_runner_def, import_scope=None):
     """Returns a `QueueRunner` object created from `queue_runner_def`."""
-    return QueueRunner(queue_runner_def=queue_runner_def)
+    return QueueRunner(queue_runner_def=queue_runner_def,
+                       import_scope=import_scope)
 
 
 def add_queue_runner(qr, collection=ops.GraphKeys.QUEUE_RUNNERS):

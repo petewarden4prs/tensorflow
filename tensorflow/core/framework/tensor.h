@@ -435,6 +435,7 @@ class Tensor {
   friend class VariableOp;            // For access to set_shape
   friend class AutoReloadVariableOp;  // For access to set_shape
   friend class TensorTestHelper;      // For access to set_shape
+  friend class CreateVariableOp;
 
   // Creates a tensor with the input datatype, shape and buf.
   //
@@ -465,6 +466,8 @@ class Tensor {
 };
 
 // Implementation details
+
+// START_SKIP_DOXYGEN
 
 // Interface to access the raw ref-counted data buffer.
 class TensorBuffer : public core::RefCounted {
@@ -658,6 +661,8 @@ inline Tensor& Tensor::operator=(Tensor&& other) {
   }
   return *this;
 }
+
+// END_SKIP_DOXYGEN
 
 }  // namespace tensorflow
 

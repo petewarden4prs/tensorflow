@@ -22,7 +22,9 @@ It is assumed that the pooling is done per image but not in batch or channels.
 ##### Args:
 
 
-*  <b>`inputs`</b>: A `Tensor` of size [batch_size, height, width, channels].
+*  <b>`inputs`</b>: A 4-D tensor of shape `[batch_size, height, width, channels]` if
+    `data_format` is `NHWC`, and `[batch_size, channels, height, width]` if
+    `data_format` is `NCHW`.
 *  <b>`kernel_size`</b>: A list of length 2: [kernel_height, kernel_width] of the
     pooling kernel over which the op is computed. Can be an int if both
     values are the same.
@@ -30,12 +32,18 @@ It is assumed that the pooling is done per image but not in batch or channels.
     Can be an int if both strides are the same. Note that presently
     both strides must have the same value.
 *  <b>`padding`</b>: The padding method, either 'VALID' or 'SAME'.
+*  <b>`data_format`</b>: A string. `NHWC` (default) and `NCHW` are supported.
 *  <b>`outputs_collections`</b>: The collections to which the outputs are added.
 *  <b>`scope`</b>: Optional scope for name_scope.
 
 ##### Returns:
 
   A `Tensor` representing the results of the pooling operation.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: if `data_format` is neither `NHWC` nor `NCHW`.
 
 
 - - -
@@ -60,14 +68,16 @@ they need to be added as a dependency to the `train_op`, example:
     updates = tf.group(*update_ops)
     total_loss = control_flow_ops.with_dependencies([updates], total_loss)
 
-One can set update_collections=None to force the updates in place, but that
+One can set updates_collections=None to force the updates in place, but that
 can have speed penalty, specially in distributed settings.
 
 ##### Args:
 
 
 *  <b>`inputs`</b>: a tensor with 2 or more dimensions, where the first dimension has
-    `batch_size`. The normalization is over all but the last dimension.
+    `batch_size`. The normalization is over all but the last dimension if
+    `data_format` is `NHWC` and the second dimension if `data_format` is
+    `NCHW`.
 *  <b>`decay`</b>: decay for the moving average.
 *  <b>`center`</b>: If True, subtract `beta`. If False, `beta` is ignored.
 *  <b>`scale`</b>: If True, multiply by `gamma`. If False, `gamma` is
@@ -76,6 +86,8 @@ can have speed penalty, specially in distributed settings.
 *  <b>`epsilon`</b>: small float added to variance to avoid dividing by zero.
 *  <b>`activation_fn`</b>: activation function, default set to None to skip it and
     maintain a linear activation.
+*  <b>`param_initializers`</b>: optional initializers for beta, gamma, moving mean and
+    moving variance.
 *  <b>`updates_collections`</b>: collections to collect the update ops for computation.
     The updates_ops need to be executed with the train_op.
     If None, a control dependency would be added to make sure the updates are
@@ -96,6 +108,8 @@ can have speed penalty, specially in distributed settings.
     then the batch normalization uses weighted mean and
     variance. (This can be used to correct for bias in training
     example selection.)
+*  <b>`fused`</b>: Use nn.fused_batch_norm if True, nn.batch_normalization otherwise.
+*  <b>`data_format`</b>: A string. `NHWC` (default) and `NCHW` are supported.
 *  <b>`scope`</b>: Optional scope for `variable_scope`.
 
 ##### Returns:
@@ -105,6 +119,10 @@ can have speed penalty, specially in distributed settings.
 ##### Raises:
 
 
+*  <b>`ValueError`</b>: if `batch_weights` is not None and `fused` is True.
+*  <b>`ValueError`</b>: if `data_format` is neither `NHWC` nor `NCHW`.
+*  <b>`ValueError`</b>: if `data_format` is `NCHW` while `fused` is False.
+*  <b>`ValueError`</b>: if the rank of `inputs` is undefined.
 *  <b>`ValueError`</b>: if rank or last dimension of `inputs` is undefined.
 
 
@@ -112,33 +130,49 @@ can have speed penalty, specially in distributed settings.
 
 ### `tf.contrib.layers.convolution2d(*args, **kwargs)` {#convolution2d}
 
-Adds a 2D convolution followed by an optional batch_norm layer.
+Adds an N-D convolution followed by an optional batch_norm layer.
 
-`convolution2d` creates a variable called `weights`, representing the
-convolutional kernel, that is convolved with the `inputs` to produce a
-`Tensor` of activations. If a `normalizer_fn` is provided (such as
-`batch_norm`), it is then applied. Otherwise, if `normalizer_fn` is
-None and a `biases_initializer` is provided then a `biases` variable would be
-created and added the activations. Finally, if `activation_fn` is not `None`,
-it is applied to the activations as well.
+It is required that 1 <= N <= 3.
 
-Performs a'trous convolution with input stride equal to rate if rate is
-greater than one.
+`convolution` creates a variable called `weights`, representing the
+convolutional kernel, that is convolved (actually cross-correlated) with the
+`inputs` to produce a `Tensor` of activations. If a `normalizer_fn` is
+provided (such as `batch_norm`), it is then applied. Otherwise, if
+`normalizer_fn` is None and a `biases_initializer` is provided then a `biases`
+variable would be created and added the activations. Finally, if
+`activation_fn` is not `None`, it is applied to the activations as well.
+
+Performs a'trous convolution with input stride/dilation rate equal to `rate`
+if a value > 1 for any dimension of `rate` is specified.  In this case
+`stride` values != 1 are not supported.
 
 ##### Args:
 
 
-*  <b>`inputs`</b>: a 4-D tensor  `[batch_size, height, width, channels]`.
+*  <b>`inputs`</b>: a Tensor of rank N+2 of shape
+    `[batch_size] + input_spatial_shape + [in_channels]` if data_format does
+    not start with "NC" (default), or
+    `[batch_size, in_channels] + input_spatial_shape` if data_format starts
+    with "NC".
 *  <b>`num_outputs`</b>: integer, the number of output filters.
-*  <b>`kernel_size`</b>: a list of length 2 `[kernel_height, kernel_width]` of
-    of the filters. Can be an int if both values are the same.
-*  <b>`stride`</b>: a list of length 2 `[stride_height, stride_width]`.
-    Can be an int if both strides are the same. Note that presently
-    both strides must have the same value.
-*  <b>`padding`</b>: one of `VALID` or `SAME`.
-*  <b>`rate`</b>: integer. If less than or equal to 1, a standard convolution is used.
-    If greater than 1, than the a'trous convolution is applied and `stride`
-    must be set to 1.
+*  <b>`kernel_size`</b>: a sequence of N positive integers specifying the spatial
+    dimensions of of the filters.  Can be a single integer to specify the same
+    value for all spatial dimensions.
+*  <b>`stride`</b>: a sequence of N positive integers specifying the stride at which to
+    compute output.  Can be a single integer to specify the same value for all
+    spatial dimensions.  Specifying any `stride` value != 1 is incompatible
+    with specifying any `rate` value != 1.
+*  <b>`padding`</b>: one of `"VALID"` or `"SAME"`.
+*  <b>`data_format`</b>: A string or None.  Specifies whether the channel dimension of
+    the `input` and output is the last dimension (default, or if `data_format`
+    does not start with "NC"), or the second dimension (if `data_format`
+    starts with "NC").  For N=1, the valid values are "NWC" (default) and
+    "NCW".  For N=2, the valid values are "NHWC" (default) and "NCHW".  For
+    N=3, currently the only valid value is "NDHWC".
+*  <b>`rate`</b>: a sequence of N positive integers specifying the dilation rate to use
+    for a'trous convolution.  Can be a single integer to specify the same
+    value for all spatial dimensions.  Specifying any `rate` value != 1 is
+    incompatible with specifying any `stride` value != 1.
 *  <b>`activation_fn`</b>: activation function, set to None to skip it and maintain
     a linear activation.
 *  <b>`normalizer_fn`</b>: normalization function to use instead of `biases`. If
@@ -166,7 +200,8 @@ greater than one.
 ##### Raises:
 
 
-*  <b>`ValueError`</b>: if both 'rate' and `stride` are larger than one.
+*  <b>`ValueError`</b>: if `data_format` is invalid.
+*  <b>`ValueError`</b>: both 'rate' and `stride` are not uniformly 1.
 
 
 - - -
@@ -234,7 +269,9 @@ second variable called 'biases' is added to the result of the operation.
 ##### Args:
 
 
-*  <b>`inputs`</b>: a tensor of size [batch_size, height, width, channels].
+*  <b>`inputs`</b>: A 4-D `Tensor` of type `float` and shape
+    `[batch, height, width, in_channels]` for `NHWC` data format or
+    `[batch, in_channels, height, width]` for `NCHW` data format.
 *  <b>`num_outputs`</b>: integer, the number of output filters.
 *  <b>`kernel_size`</b>: a list of length 2 holding the [kernel_height, kernel_width] of
     of the filters. Can be an int if both values are the same.
@@ -242,6 +279,7 @@ second variable called 'biases' is added to the result of the operation.
     Can be an int if both strides are the same.  Note that presently
     both strides must have the same value.
 *  <b>`padding`</b>: one of 'VALID' or 'SAME'.
+*  <b>`data_format`</b>: A string. `NHWC` (default) and `NCHW` are supported.
 *  <b>`activation_fn`</b>: activation function, set to None to skip it and maintain
     a linear activation.
 *  <b>`normalizer_fn`</b>: normalization function to use instead of `biases`. If
@@ -269,6 +307,8 @@ second variable called 'biases' is added to the result of the operation.
 
 
 *  <b>`ValueError`</b>: if 'kernel_size' is not a list of length 2.
+*  <b>`ValueError`</b>: if `data_format` is neither `NHWC` nor `NCHW`.
+*  <b>`ValueError`</b>: if `C` dimension of `inputs` is None.
 
 
 - - -
@@ -401,7 +441,9 @@ It is assumed that the pooling is done per image but not in batch or channels.
 ##### Args:
 
 
-*  <b>`inputs`</b>: A `Tensor` of size [batch_size, height, width, channels].
+*  <b>`inputs`</b>: A 4-D tensor of shape `[batch_size, height, width, channels]` if
+    `data_format` is `NHWC`, and `[batch_size, channels, height, width]` if
+    `data_format` is `NCHW`.
 *  <b>`kernel_size`</b>: A list of length 2: [kernel_height, kernel_width] of the
     pooling kernel over which the op is computed. Can be an int if both
     values are the same.
@@ -409,6 +451,7 @@ It is assumed that the pooling is done per image but not in batch or channels.
     Can be an int if both strides are the same. Note that presently
     both strides must have the same value.
 *  <b>`padding`</b>: The padding method, either 'VALID' or 'SAME'.
+*  <b>`data_format`</b>: A string. `NHWC` (default) and `NCHW` are supported.
 *  <b>`outputs_collections`</b>: The collections to which the outputs are added.
 *  <b>`scope`</b>: Optional scope for name_scope.
 
@@ -419,6 +462,7 @@ It is assumed that the pooling is done per image but not in batch or channels.
 ##### Raises:
 
 
+*  <b>`ValueError`</b>: if `data_format` is neither `NHWC` nor `NCHW`.
 *  <b>`ValueError`</b>: If 'kernel_size' is not a 2-D list
 
 
@@ -587,44 +631,49 @@ to produce the end result.
 
 - - -
 
-### `tf.contrib.layers.stack(inputs, layer, stack_args, **kwargs)` {#stack}
+### `tf.stack(values, axis=0, name='stack')` {#stack}
 
-Builds a stack of layers by applying layer repeatedly using stack_args.
+Stacks a list of rank-`R` tensors into one rank-`(R+1)` tensor.
 
-`stack` allows you to repeatedly apply the same operation with different
-arguments `stack_args[i]`. For each application of the layer, `stack` creates
-a new scope appended with an increasing number. For example:
+Packs the list of tensors in `values` into a tensor with rank one higher than
+each tensor in `values`, by packing them along the `axis` dimension.
+Given a list of length `N` of tensors of shape `(A, B, C)`;
 
-```python
-  y = stack(x, fully_connected, [32, 64, 128], scope='fc')
-  # It is equivalent to:
+if `axis == 0` then the `output` tensor will have the shape `(N, A, B, C)`.
+if `axis == 1` then the `output` tensor will have the shape `(A, N, B, C)`.
+Etc.
 
-  x = fully_connected(x, 32, scope='fc/fc_1')
-  x = fully_connected(x, 64, scope='fc/fc_2')
-  y = fully_connected(x, 128, scope='fc/fc_3')
+For example:
+
+```prettyprint
+# 'x' is [1, 4]
+# 'y' is [2, 5]
+# 'z' is [3, 6]
+stack([x, y, z]) => [[1, 4], [2, 5], [3, 6]]  # Pack along first dim.
+stack([x, y, z], axis=1) => [[1, 2, 3], [4, 5, 6]]
 ```
 
-If the `scope` argument is not given in `kwargs`, it is set to
-`layer.__name__`, or `layer.func.__name__` (for `functools.partial`
-objects). If neither `__name__` nor `func.__name__` is available, the
-layers are called with `scope='stack'`.
+This is the opposite of unstack.  The numpy equivalent is
+
+    tf.stack([x, y, z]) = np.asarray([x, y, z])
 
 ##### Args:
 
 
-*  <b>`inputs`</b>: A `Tensor` suitable for layer.
-*  <b>`layer`</b>: A layer with arguments `(inputs, *args, **kwargs)`
-*  <b>`stack_args`</b>: A list/tuple of parameters for each call of layer.
-*  <b>`**kwargs`</b>: Extra kwargs for the layer.
+*  <b>`values`</b>: A list of `Tensor` objects with the same shape and type.
+*  <b>`axis`</b>: An `int`. The axis to stack along. Defaults to the first dimension.
+    Supports negative indexes.
+*  <b>`name`</b>: A name for this operation (optional).
 
 ##### Returns:
 
-  a `Tensor` result of applying the stacked layers.
+
+*  <b>`output`</b>: A stacked `Tensor` with the same type as `values`.
 
 ##### Raises:
 
 
-*  <b>`ValueError`</b>: if the op is unknown or wrong.
+*  <b>`ValueError`</b>: If `axis` is out of the range [-(R+1), R+1).
 
 
 - - -
@@ -917,9 +966,14 @@ Various ways of passing optimizers, include:
 ##### Args:
 
 
-*  <b>`loss`</b>: Tensor, 0 dimensional.
-*  <b>`global_step`</b>: Tensor, step counter for each update.
-*  <b>`learning_rate`</b>: float or Tensor, magnitude of update per each training step.
+*  <b>`loss`</b>: Scalar `Tensor`.
+*  <b>`global_step`</b>: Scalar int `Tensor`, step counter for each update. If not
+               supplied, it will be fetched from the default graph (see
+               `tf.contrib.framework.get_global_step` for details). If it's
+               not been created, no step will be incremented with each weight
+               update. `learning_rate_decay_fn` requires `global_step`.
+*  <b>`learning_rate`</b>: float or `Tensor`, magnitude of update per each training
+                 step. Can be `None`.
 *  <b>`optimizer`</b>: string, class or optimizer instance, used as trainer.
              string should be name of optimizer, like 'SGD',
                'Adam', 'Adagrad'. Full list in OPTIMIZER_CLS_NAMES constant.
@@ -933,12 +987,17 @@ Various ways of passing optimizers, include:
 *  <b>`gradient_multipliers`</b>: dict of variables or variable names to floats.
                         If present, gradients for specified
                         variables will be multiplied by given constant.
-*  <b>`clip_gradients`</b>: float or `None`, clips gradients by this value.
+*  <b>`clip_gradients`</b>: float, callable or `None`. If float, is provided, a global
+    clipping is applied to prevent the norm of the gradient to exceed this
+    value. Alternatively, a callable can be provided e.g.: adaptive_clipping.
+    This callable takes a `list` of `(gradients, variables)` `tuple`s and
+    returns the same thing with the gradients modified.
 *  <b>`learning_rate_decay_fn`</b>: function, takes `learning_rate` and `global_step`
                           `Tensor`s, returns `Tensor`.
                           Can be used to implement any learning rate decay
                           functions.
                           For example: `tf.train.exponential_decay`.
+                          Ignored if `learning_rate` is not supplied.
 *  <b>`update_ops`</b>: list of update `Operation`s to execute at each step. If `None`,
               uses elements of UPDATE_OPS collection. The order of execution
               between `update_ops` and `loss` is non-deterministic.
@@ -958,7 +1017,14 @@ Various ways of passing optimizers, include:
 ##### Raises:
 
 
-*  <b>`ValueError`</b>: if optimizer is wrong type.
+*  <b>`ValueError`</b>: if:
+      * `loss` is an invalid type or shape.
+      * `global_step` is an invalid type or shape.
+      * `learning_rate` is an invalid type or value.
+      * `optimizer` is wrong type.
+      * `clip_gradients` is not float or callable.
+      * `learning_rate` and `learning_rate_decay_fn` are supplied, but no
+        `global_step` is available.
 
 
 

@@ -80,6 +80,27 @@ Returns x * y element-wise.
 
 - - -
 
+### `tf.multiply(x, y, name=None)` {#multiply}
+
+Returns x * y element-wise.
+
+*NOTE*: `Mul` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
+##### Args:
+
+
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `half`, `float32`, `float64`, `uint8`, `int8`, `uint16`, `int16`, `int32`, `int64`, `complex64`, `complex128`.
+*  <b>`y`</b>: A `Tensor`. Must have the same type as `x`.
+*  <b>`name`</b>: A name for the operation (optional).
+
+##### Returns:
+
+  A `Tensor`. Has the same type as `x`.
+
+
+- - -
+
 ### `tf.scalar_mul(scalar, x)` {#scalar_mul}
 
 Multiplies a scalar times a `Tensor` or `IndexedSlices` object.
@@ -123,6 +144,13 @@ Returns x / y element-wise.
 ##### Returns:
 
   A `Tensor`. Has the same type as `x`.
+
+
+- - -
+
+### `tf.divide(x, y, name=None)` {#divide}
+
+Computes Python style division of `x` by `y`.
 
 
 - - -
@@ -318,6 +346,25 @@ I.e., \(y = -x\).
 
 - - -
 
+### `tf.negative(x, name=None)` {#negative}
+
+Computes numerical negative value element-wise.
+
+I.e., \\(y = -x\\).
+
+##### Args:
+
+
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `half`, `float32`, `float64`, `int32`, `int64`, `complex64`, `complex128`.
+*  <b>`name`</b>: A name for the operation (optional).
+
+##### Returns:
+
+  A `Tensor`. Has the same type as `x`.
+
+
+- - -
+
 ### `tf.sign(x, name=None)` {#sign}
 
 Returns an element-wise indication of the sign of a number.
@@ -383,11 +430,13 @@ I.e., \(y = x * x = x^2\).
 
 Rounds the values of a tensor to the nearest integer, element-wise.
 
+Rounds half to even.  Also known as bankers rounding. If you want to round
+according to the current system rounding mode use tf::cint.
 For example:
 
 ```python
-# 'a' is [0.9, 2.5, 2.3, -4.4]
-tf.round(a) ==> [ 1.0, 3.0, 2.0, -4.0 ]
+# 'a' is [0.9, 2.5, 2.3, 1.5, -4.5]
+tf.round(a) ==> [ 1.0, 2.0, 2.0, 2.0, -4.0 ]
 ```
 
 ##### Args:
@@ -1133,6 +1182,45 @@ tf.transpose(x, perm=[0, 2, 1]) ==> [[[1  4]
 
 - - -
 
+### `tf.eye(num_rows, num_columns=None, batch_shape=None, dtype=tf.float32, name=None)` {#eye}
+
+Construct an identity matrix, or a batch of matrices.
+
+```python
+# Construct one identity matrix.
+tf.eye(2)
+==> [[1., 0.],
+     [0., 1.]]
+
+# Construct a batch of 3 identity matricies, each 2 x 2.
+# batch_identity[i, :, :] is a 2 x 2 identity matrix, i = 0, 1, 2.
+batch_identity = tf.eye(2, batch_shape=[3])
+
+# Construct one 2 x 3 "identity" matrix
+tf.eye(2, num_columns=3)
+==> [[ 1.,  0.,  0.],
+     [ 0.,  1.,  0.]]
+```
+
+##### Args:
+
+
+*  <b>`num_rows`</b>: Non-negative `int32` scalar `Tensor` giving the number of rows
+    in each batch matrix.
+*  <b>`num_columns`</b>: Optional non-negative `int32` scalar `Tensor` giving the number
+    of columns in each batch matrix.  Defaults to `num_rows`.
+*  <b>`batch_shape`</b>: `int32` `Tensor`.  If provided, returned `Tensor` will have
+    leading batch dimensions of this shape.
+*  <b>`dtype`</b>: The type of an element in the resulting `Tensor`
+*  <b>`name`</b>: A name for this `Op`.  Defaults to "eye".
+
+##### Returns:
+
+  A `Tensor` of shape `batch_shape + [num_rows, num_columns]`
+
+
+- - -
+
 ### `tf.matrix_diag(diagonal, name=None)` {#matrix_diag}
 
 Returns a batched diagonal tensor with a given batched diagonal values.
@@ -1583,7 +1671,7 @@ If `adjoint` is `True` then each output matrix satisfies
 ##### Args:
 
 
-*  <b>`matrix`</b>: A `Tensor`. Must be one of the following types: `float64`, `float32`.
+*  <b>`matrix`</b>: A `Tensor`. Must be one of the following types: `float64`, `float32`, `complex64`, `complex128`.
     Shape is `[..., M, M]`.
 *  <b>`rhs`</b>: A `Tensor`. Must have the same type as `matrix`.
     Shape is `[..., M, K]`.
@@ -2372,6 +2460,51 @@ tf.reduce_logsumexp(x, [0, 1]) ==> log(6)
   The reduced tensor.
 
 
+- - -
+
+### `tf.count_nonzero(input_tensor, reduction_indices=None, keep_dims=False, dtype=tf.int64, name=None)` {#count_nonzero}
+
+Computes number of nonzero elements across dimensions of a tensor.
+
+Reduces `input_tensor` along the dimensions given in `reduction_indices`.
+Unless `keep_dims` is true, the rank of the tensor is reduced by 1 for each
+entry in `reduction_indices`. If `keep_dims` is true, the reduced dimensions
+are retained with length 1.
+
+If `reduction_indices` has no entries, all dimensions are reduced, and a
+tensor with a single element is returned.
+
+**NOTE** Floating point comparison to zero is done by exact floating point
+equality check.  Small values are **not** rounded to zero for purposes of
+the nonzero check.
+
+For example:
+
+```python
+# 'x' is [[0, 1, 0]
+#         [1, 1, 0]]
+tf.count_nonzero(x) ==> 3
+tf.count_nonzero(x, 0) ==> [1, 2, 0]
+tf.count_nonzero(x, 1) ==> [1, 2]
+tf.count_nonzero(x, 1, keep_dims=True) ==> [[1], [2]]
+tf.count_nonzero(x, [0, 1]) ==> 3
+```
+
+##### Args:
+
+
+*  <b>`input_tensor`</b>: The tensor to reduce. Should be of numeric type, or `bool`.
+*  <b>`reduction_indices`</b>: The dimensions to reduce. If `None` (the default),
+    reduces all dimensions.
+*  <b>`keep_dims`</b>: If true, retains reduced dimensions with length 1.
+*  <b>`dtype`</b>: The output dtype; defaults to `tf.int64`.
+*  <b>`name`</b>: A name for the operation (optional).
+
+##### Returns:
+
+  The reduced tensor (number of nonzero values).
+
+
 
 - - -
 
@@ -2423,7 +2556,28 @@ tf.accumulate_n([a, b, a], shape=[2, 2], tensor_dtype=tf.int32)
 
 A generalized contraction between tensors of arbitrary dimension.
 
-Like numpy.einsum.
+Like `numpy.einsum`, but does not support:
+* Ellipses (subscripts like `ij...,jk...->ik...`)
+* Subscripts where an axis appears more than once for a single input (e.g. `ijj,jk->ik`).
+
+##### Args:
+
+
+*  <b>`axes`</b>: a `str` describing the contraction, in the same format as `numpy.einsum`.
+*  <b>`inputs`</b>: the inputs to contract (each one a `Tensor`), whose shapes should be consistent with `axes`.
+
+##### Returns:
+
+  The contracted `Tensor`, with shape determined by `axes`.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: If the format of `axes` is incorrect,
+              or the number of inputs implied by `axes` does not match `len(inputs)`,
+              or an axis appears in the output subscripts but not in any of the inputs,
+              or the number of dimensions of an input differs from the number of indices in its subscript,
+              or the input shapes are inconsistent along a particular axis.
 
 
 
@@ -2494,7 +2648,7 @@ By setting the `exclusive` kwarg to `True`, an exclusive cumprod is
 performed
 instead:
 ```prettyprint
-tf.cumprod([a, b, c], exclusive=True) ==> [0, a, a * b]
+tf.cumprod([a, b, c], exclusive=True) ==> [1, a, a * b]
 ```
 
 By setting the `reverse` kwarg to `True`, the cumprod is performed in the
@@ -2506,7 +2660,7 @@ This is more efficient than using separate `tf.reverse` ops.
 
 The `reverse` and `exclusive` kwargs can also be combined:
 ```prettyprint
-tf.cumprod([a, b, c], exclusive=True, reverse=True) ==> [b * c, c, 0]
+tf.cumprod([a, b, c], exclusive=True, reverse=True) ==> [b * c, c, 1]
 ```
 
 ##### Args:
@@ -2966,51 +3120,52 @@ idx ==> [1, 3, 5]
 
 - - -
 
-### `tf.where(input, name=None)` {#where}
+### `tf.where(condition, x=None, y=None, name=None)` {#where}
 
-Returns locations of true values in a boolean tensor.
+Return the elements, either from `x` or `y`, depending on the `condition`.
 
-This operation returns the coordinates of true elements in `input`. The
-coordinates are returned in a 2-D tensor where the first dimension (rows)
-represents the number of true elements, and the second dimension (columns)
-represents the coordinates of the true elements. Keep in mind, the shape of
-the output tensor can vary depending on how many true values there are in
-`input`. Indices are output in row-major order.
+If both `x` and `y` are None, then this operation returns the coordinates of
+true elements of `condition`.  The coordinates are returned in a 2-D tensor
+where the first dimension (rows) represents the number of true elements, and
+the second dimension (columns) represents the coordinates of the true
+elements. Keep in mind, the shape of the output tensor can vary depending on
+how many true values there are in input. Indices are output in row-major
+order.
 
-For example:
+If both non-None, `x` and `y` must have the same shape.
+The `condition` tensor must be a scalar if `x` and `y` are scalar.
+If `x` and `y` are vectors or higher rank, then `condition` must be either a
+vector with size matching the first dimension of `x`, or must have the same
+shape as `x`.
 
-```prettyprint
-# 'input' tensor is [[True, False]
-#                    [True, False]]
-# 'input' has two true values, so output has two coordinates.
-# 'input' has rank of 2, so coordinates have two indices.
-where(input) ==> [[0, 0],
-                  [1, 0]]
+The `condition` tensor acts as a mask that chooses, based on the value at each
+element, whether the corresponding element / row in the output should be taken
+from `x` (if true) or `y` (if false).
 
-# `input` tensor is [[[True, False]
-#                     [True, False]]
-#                    [[False, True]
-#                     [False, True]]
-#                    [[False, False]
-#                     [False, True]]]
-# 'input' has 5 true values, so output has 5 coordinates.
-# 'input' has rank of 3, so coordinates have three indices.
-where(input) ==> [[0, 0, 0],
-                  [0, 1, 0],
-                  [1, 0, 1],
-                  [1, 1, 1],
-                  [2, 1, 1]]
-```
+If `condition` is a vector and `x` and `y` are higher rank matrices, then it
+chooses which row (outer dimension) to copy from `x` and `y`. If `condition`
+has the same shape as `x` and `y`, then it chooses which element to copy from
+`x` and `y`.
 
 ##### Args:
 
 
-*  <b>`input`</b>: A `Tensor` of type `bool`.
-*  <b>`name`</b>: A name for the operation (optional).
+*  <b>`condition`</b>: A `Tensor` of type `bool`
+*  <b>`x`</b>: A Tensor which may have the same shape as `condition`. If `condition` is
+    rank 1, `x` may have higher rank, but its first dimension must match the
+    size of `condition`.
+*  <b>`y`</b>: A `tensor` with the same shape and type as `x`.
+*  <b>`name`</b>: A name of the operation (optional)
 
 ##### Returns:
 
-  A `Tensor` of type `int64`.
+  A `Tensor` with the same type and shape as `x`, `y` if they are non-None.
+  A `Tensor` with shape `(num_true, dim_size(condition))`.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: When exactly one of `x` or `y` is non-None.
 
 
 - - -

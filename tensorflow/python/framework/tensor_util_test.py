@@ -23,7 +23,7 @@ import tensorflow as tf
 
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import tensor_util
-from tensorflow.python.ops import state_ops
+from tensorflow.python.ops import gen_state_ops
 
 
 class TensorUtilTest(tf.test.TestCase):
@@ -376,6 +376,34 @@ class TensorUtilTest(tf.test.TestCase):
     self.assertEquals(np.object, a.dtype)
     self.assertAllEqual(np.array([[b"a", b"ab"], [b"abc", b"abcd"]]), a)
 
+  def testStringTuple(self):
+    t = tensor_util.make_tensor_proto((b"a", b"ab", b"abc", b"abcd"))
+    self.assertProtoEquals("""
+      dtype: DT_STRING
+      tensor_shape { dim { size: 4 } }
+      string_val: "a"
+      string_val: "ab"
+      string_val: "abc"
+      string_val: "abcd"
+      """, t)
+    a = tensor_util.MakeNdarray(t)
+    self.assertEquals(np.object, a.dtype)
+    self.assertAllEqual(np.array((b"a", b"ab", b"abc", b"abcd")), a)
+
+  def testStringNestedTuple(self):
+    t = tensor_util.make_tensor_proto(((b"a", b"ab"), (b"abc", b"abcd")))
+    self.assertProtoEquals("""
+      dtype: DT_STRING
+      tensor_shape { dim { size: 2 } dim { size: 2 } }
+      string_val: "a"
+      string_val: "ab"
+      string_val: "abc"
+      string_val: "abcd"
+      """, t)
+    a = tensor_util.MakeNdarray(t)
+    self.assertEquals(np.object, a.dtype)
+    self.assertAllEqual(np.array(((b"a", b"ab"), (b"abc", b"abcd"))), a)
+
   def testComplex64(self):
     t = tensor_util.make_tensor_proto((1+2j), dtype=tf.complex64)
     self.assertProtoEquals("""
@@ -524,7 +552,8 @@ class ConstantValueTest(tf.test.TestCase):
     self.assertAllClose(np_val, tf.contrib.util.constant_value(tf_val))
 
   def testUnknown(self):
-    tf_val = state_ops.variable_op(shape=[3, 4, 7], dtype=tf.float32)
+    tf_val = gen_state_ops._variable(shape=[3, 4, 7], dtype=tf.float32, 
+        name="tf_val", container="", shared_name="")
     self.assertIs(None, tf.contrib.util.constant_value(tf_val))
 
   def testShape(self):

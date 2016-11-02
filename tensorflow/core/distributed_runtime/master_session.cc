@@ -19,16 +19,13 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
-#include "tensorflow/core/common_runtime/device_set.h"
 #include "tensorflow/core/common_runtime/process_util.h"
 #include "tensorflow/core/common_runtime/profile_handler.h"
-#include "tensorflow/core/common_runtime/simple_graph_execution_state.h"
 #include "tensorflow/core/common_runtime/stats_publisher_interface.h"
-#include "tensorflow/core/distributed_runtime/master_env.h"
-#include "tensorflow/core/distributed_runtime/master_session_interface.h"
 #include "tensorflow/core/distributed_runtime/scheduler.h"
 #include "tensorflow/core/distributed_runtime/worker_cache.h"
 #include "tensorflow/core/distributed_runtime/worker_interface.h"
+#include "tensorflow/core/framework/cost_graph.pb.h"
 #include "tensorflow/core/framework/function.pb.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -49,13 +46,10 @@ limitations under the License.
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/tracing.h"
-#include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/protobuf/master.pb.h"
 #include "tensorflow/core/public/session_options.h"
 
 namespace tensorflow {
 
-namespace {
 // A little bit of per-step state.
 struct PerStepState {
   bool collect_costs = false;
@@ -65,118 +59,7 @@ struct PerStepState {
   Microseconds end_micros = Microseconds(0);
   std::vector<StepStats> step_stats;  // per partition
   StepStats rpc_stats;                // for RPC layer
-};
-
-// A session encapsulates a graph computation (resource allocation,
-// placement, execution, etc.).
-class MasterSession : public MasterSessionInterface {
- public:
-  // This session encapsulates the graph computation for a graph.
-  //
-  // The session places nodes on devices in "remote_devs" and executes
-  // operations on these devices.
-  //
-  // The caller takes ownership of all remote devices.
-  MasterSession(const SessionOptions& options, const MasterEnv* env,
-                std::vector<Device*>* remote_devs,
-                StatsPublisherFactory stats_publisher_factory);
-
-  // Initialize the MasterSession for "def".  Must be called before Extend(),
-  // Run(), or Close().
-  //
-  // The callee may clear "def".
-  Status Create(GraphDef* def) override;
-
-  // Returns the session handle.
-  const string& handle() const override { return handle_; }
-
-  // Returns the last access time (the number of micro-seconds since
-  // some fixed point in time) of this session.
-  uint64 last_access_time_usec() const override {
-    return last_access_time_usec_.load();
-  }
-
-  // Attempt to extend the graph according to the given "req".
-  // (See master.proto for details of valid extensions.)
-  //
-  // PRECONDITION: The current version of this session's graph
-  //   is "req->current_graph_version".
-  //
-  // POSTCONDITION: The current version of this session's graph
-  //   is "resp->new_graph_version".
-  //
-  // Extend() may block the caller thread for a long time.
-  Status Extend(const ExtendSessionRequest* req,
-                ExtendSessionResponse* resp) override;
-
-  // Run one step.
-  Status Run(CallOptions* opts, const RunStepRequest* req,
-             RunStepResponse* resp) override;
-
-  // Close this session and delete "*this". Returns OK if all known
-  // states are cleanup successfully.
-  //
-  // Close() may block the caller thread for a long time.
-  Status Close() override;
-
- private:
-  SessionOptions session_opts_;
-
-  // Not owned.
-  const MasterEnv* env_;
-
-  // The opaque session handle.
-  const string handle_;
-
-  // Owned.
-  std::vector<Device*> remote_devs_;
-
-  // The device set used by this session.
-  DeviceSet devices_;
-
-  StatsPublisherFactory stats_publisher_factory_;
-
-  std::atomic_ulong last_access_time_usec_;
-
-  mutex mu_;
-  std::unique_ptr<SimpleGraphExecutionState> execution_state_;
-  int64 graph_version_;
-
-  // We keep a map from a signature of a run request to the
-  // ReffedClientGraph the can execute it.  We keep up to one old copy
-  // of each ReffedClientGraph around because if it gets deallocated
-  // before a new substitute has been created, Variables can go out of
-  // scope and lose their state.
-  class ReffedClientGraph;
-  typedef std::unordered_map<uint64, ReffedClientGraph*> RCGMap;
-  RCGMap runs_ GUARDED_BY(mu_);
-  RCGMap obsolete_ GUARDED_BY(mu_);
-
-  // Active RunStep calls.
-  condition_variable num_running_is_zero_;
-  int32 num_running_ GUARDED_BY(mu_) = 0;
-
-  std::unordered_map<uint64, int64> subgraph_execution_counts_ GUARDED_BY(mu_);
-
-  // We need to ensure that certain nodes added (e.g., send and recv
-  // nodes) are unique across all sub-graphs within this session.
-  int64 next_node_id_ GUARDED_BY(mu_) = 0;
-
-  // Used to cancel running steps on Close().
-  CancellationManager* cancellation_manager_;
-
-  // Private dtor. The client must call Close().
-  virtual ~MasterSession();
-
-  Status StartStep(const RunStepRequest& req, BuildGraphOptions* opts,
-                   int64* count, ReffedClientGraph** graph);
-  void ClearRunsTable(std::vector<ReffedClientGraph*>* to_unref,
-                      RCGMap* rcg_map) EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  Status DoRunWithLocalExecution(CallOptions* opts, const RunStepRequest* req,
-                                 RunStepResponse* resp);
-  void UpdateLastAccessTime();
-
-  TF_DISALLOW_COPY_AND_ASSIGN(MasterSession);
+  CostGraphDef cost_graph;
 };
 
 // MasterSession wraps SimpleClientGraph in a reference counted object.
@@ -297,9 +180,10 @@ class MasterSession::ReffedClientGraph : public core::RefCounted {
   // Post-processing of any runtime statistics gathered during execution.
   void ProcessStats(const MasterEnv* env, int64 step_id, PerStepState* pss,
                     SimpleGraphExecutionState* execution_state,
-                    ProfileHandler* ph, RunStepResponse* resp);
+                    ProfileHandler* ph, const RunStepRequest& req,
+                    RunStepResponse* resp);
   void ProcessDeviceStats(ProfileHandler* ph,
-                          SimpleGraphExecutionState* execution_state,
+                          const SimpleGraphExecutionState* execution_state,
                           const DeviceStepStats& ds, bool is_rpc);
 
   string DetailText(const NodeDef& def, const NodeExecStats& ns) {
@@ -599,17 +483,6 @@ class RunManyGraphs {
   TF_DISALLOW_COPY_AND_ASSIGN(RunManyGraphs);
 };
 
-int64 CostFrequency(int64 x) {
-  if (x < 10) {
-    return 1;  // 100%
-  } else if (x < 100) {
-    return 10;  // 10%
-  } else if (x < 1000) {
-    return 100;  // 1%
-  } else {
-    return 1000;  // 0.1%
-  }
-}
 
 Status MasterSession::ReffedClientGraph::RunPartitions(
     const MasterEnv* env, int64 step_id, int64 execution_count,
@@ -723,6 +596,12 @@ Status MasterSession::ReffedClientGraph::RunPartitions(
       if (pss->collect_timeline && calls.get(i)->resp.has_step_stats()) {
         pss->step_stats[i].Swap(calls.get(i)->resp.mutable_step_stats());
       }
+      if (pss->collect_costs && calls.get(i)->resp.has_cost_graph()) {
+        for (int j = 0; j < calls.get(i)->resp.cost_graph().node_size(); ++j) {
+          resp->mutable_metadata()->mutable_cost_graph()->add_node()->Swap(
+              calls.get(i)->resp.mutable_cost_graph()->mutable_node(j));
+        }
+      }
     }
   }
   return status;
@@ -798,7 +677,7 @@ void MasterSession::ReffedClientGraph::CleanupPartitionsAsync(
 void MasterSession::ReffedClientGraph::ProcessStats(
     const MasterEnv* env, int64 step_id, PerStepState* pss,
     SimpleGraphExecutionState* execution_state, ProfileHandler* ph,
-    RunStepResponse* resp) {
+    const RunStepRequest& req, RunStepResponse* resp) {
   if (!pss->collect_costs && !pss->collect_timeline) return;
 
   // Out-of-band logging data is collected now, during post-processing.
@@ -808,9 +687,6 @@ void MasterSession::ReffedClientGraph::ProcessStats(
   }
   for (size_t i = 0; i < partitions_.size(); ++i) {
     const StepStats& ss = pss->step_stats[i];
-    if (pss->collect_costs) {
-      execution_state->UpdateCostsFromStats(ss);
-    }
     if (ph) {
       for (const auto& ds : ss.dev_stats()) {
         ProcessDeviceStats(ph, execution_state, ds, false /*is_rpc*/);
@@ -836,14 +712,14 @@ void MasterSession::ReffedClientGraph::ProcessStats(
     stats_publisher_->PublishStatsProto(step_stats_proto);
     // Copy the stats back, but only for on-demand profiling to avoid slowing
     // down calls that trigger the automatic profiling.
-    if (session_opts_.config.graph_options().timeline_step() <= 0) {
+    if (req.options().trace_level() == RunOptions::FULL_TRACE) {
       resp->mutable_metadata()->mutable_step_stats()->Swap(&step_stats_proto);
     }
   }
 }
 
 void MasterSession::ReffedClientGraph::ProcessDeviceStats(
-    ProfileHandler* ph, SimpleGraphExecutionState* execution_state,
+    ProfileHandler* ph, const SimpleGraphExecutionState* execution_state,
     const DeviceStepStats& ds, bool is_rpc) {
   const string& dev_name = ds.device();
   VLOG(1) << "Device " << dev_name << " reports stats for "
@@ -855,9 +731,8 @@ void MasterSession::ReffedClientGraph::ProcessDeviceStats(
       ph->RecordOneOp(dev_name, ns, true /*is_copy*/, "", ns.node_name(),
                       ns.timeline_label());
     } else {
-      NodeDef ndef;
-      Status s = execution_state->GlobalNodeDefByName(ns.node_name(), &ndef);
-      const bool found_node_in_graph = s.ok();
+      const Node* node = execution_state->get_node_by_name(ns.node_name());
+      const bool found_node_in_graph = node != nullptr;
       if (!found_node_in_graph && ns.timeline_label().empty()) {
         // The counter incrementing is not thread-safe. But we don't really
         // care.
@@ -871,12 +746,13 @@ void MasterSession::ReffedClientGraph::ProcessDeviceStats(
         }
         continue;
       }
-      string optype = found_node_in_graph ? ndef.op() : ns.node_name();
+      string optype =
+          found_node_in_graph ? node->type_string() : ns.node_name();
       string details;
       if (!ns.timeline_label().empty()) {
         details = ns.timeline_label();
       } else if (found_node_in_graph) {
-        details = DetailText(ndef, ns);
+        details = DetailText(node->def(), ns);
       } else {
         // Leave details string empty
       }
@@ -1006,15 +882,14 @@ Status MasterSession::Create(GraphDef* graph_def) {
     // TODO(b/29900832): Fix this or remove the option.
     LOG(WARNING) << "Distributed session does not support the "
                     "place_pruned_graph option.";
+    session_opts_.config.mutable_graph_options()->set_place_pruned_graph(false);
   }
 
   SimpleGraphExecutionStateOptions options;
   options.device_set = &devices_;
   options.session_options = &session_opts_;
-  execution_state_.reset(
-      new SimpleGraphExecutionState(graph_def->library(), options));
-  TF_RETURN_IF_ERROR(execution_state_->Create(graph_def));
-
+  TF_RETURN_IF_ERROR(SimpleGraphExecutionState::MakeForBaseGraph(
+      graph_def, options, &execution_state_));
   return Status::OK();
 }
 
@@ -1183,11 +1058,21 @@ Status MasterSession::DoRunWithLocalExecution(CallOptions* opts,
 
   std::unique_ptr<ProfileHandler> ph;
   pss.collect_timeline = req->options().trace_level() == RunOptions::FULL_TRACE;
-  pss.collect_costs = (0 == (count % CostFrequency(count)));
+
+  // Build the cost model every 'build_cost_model_every' steps after skipping an
+  // initial 'build_cost_model_after' steps.
+  const int64 build_cost_model_after =
+      session_opts_.config.graph_options().build_cost_model_after();
+  const int64 build_cost_model_every =
+      session_opts_.config.graph_options().build_cost_model();
+  pss.collect_costs =
+      build_cost_model_every > 0 &&
+      ((count + 1 - build_cost_model_after) % build_cost_model_every == 0);
+
   ph = rcg->GetProfileHandler(step_id, count, req->options());
   if (ph) {
     pss.collect_timeline = true;
-    pss.collect_rpcs = true;
+    pss.collect_rpcs = ph->should_collect_rpcs();
   }
 
   TF_RETURN_IF_ERROR(rcg->RunPartitions(env_, step_id, count,
@@ -1198,7 +1083,7 @@ Status MasterSession::DoRunWithLocalExecution(CallOptions* opts,
 
   // Schedule post-processing and cleanup to be done asynchronously.
   rcg->Ref();
-  rcg->ProcessStats(env_, step_id, &pss, execution_state_.get(), ph.get(),
+  rcg->ProcessStats(env_, step_id, &pss, execution_state_.get(), ph.get(), *req,
                     resp);
   rcg->CleanupPartitionsAsync(step_id, [rcg](const Status& s) {
     if (!s.ok()) {
@@ -1225,16 +1110,4 @@ Status MasterSession::Close() {
   return Status::OK();
 }
 
-}  // end namespace
-
-namespace internal {
-
-MasterSessionInterface* NewMasterSession(
-    const SessionOptions& options, const MasterEnv* env,
-    std::vector<Device*>* remote_devs,
-    StatsPublisherFactory stats_publisher_factory) {
-  return new MasterSession(options, env, remote_devs, stats_publisher_factory);
-}
-
-}  // end namespace internal
 }  // end namespace tensorflow

@@ -437,7 +437,7 @@ For example:
 ```prettyprint
 # 't' is a tensor of shape [1, 2, 1, 3, 1, 1]
 shape(squeeze(t)) ==> [2, 3]
-```
+          ```
 
 Or, to remove specific size 1 dimensions:
 
@@ -826,7 +826,7 @@ pad(t, paddings, "SYMMETRIC") ==> [[2, 1, 1, 2, 3, 3, 2],
 
 *  <b>`tensor`</b>: A `Tensor`.
 *  <b>`paddings`</b>: A `Tensor` of type `int32`.
-*  <b>`mode`</b>: One of "CONSTANT", "REFLECT", or "SYMMETRIC".
+*  <b>`mode`</b>: One of "CONSTANT", "REFLECT", or "SYMMETRIC" (case-insensitive)
 *  <b>`name`</b>: A name for the operation (optional).
 
 ##### Returns:
@@ -902,7 +902,56 @@ tf.pack(tensors, axis=axis)
 
 - - -
 
+### `tf.stack(values, axis=0, name='stack')` {#stack}
+
+Stacks a list of rank-`R` tensors into one rank-`(R+1)` tensor.
+
+Packs the list of tensors in `values` into a tensor with rank one higher than
+each tensor in `values`, by packing them along the `axis` dimension.
+Given a list of length `N` of tensors of shape `(A, B, C)`;
+
+if `axis == 0` then the `output` tensor will have the shape `(N, A, B, C)`.
+if `axis == 1` then the `output` tensor will have the shape `(A, N, B, C)`.
+Etc.
+
+For example:
+
+```prettyprint
+# 'x' is [1, 4]
+# 'y' is [2, 5]
+# 'z' is [3, 6]
+stack([x, y, z]) => [[1, 4], [2, 5], [3, 6]]  # Pack along first dim.
+stack([x, y, z], axis=1) => [[1, 2, 3], [4, 5, 6]]
+```
+
+This is the opposite of unstack.  The numpy equivalent is
+
+    tf.stack([x, y, z]) = np.asarray([x, y, z])
+
+##### Args:
+
+
+*  <b>`values`</b>: A list of `Tensor` objects with the same shape and type.
+*  <b>`axis`</b>: An `int`. The axis to stack along. Defaults to the first dimension.
+    Supports negative indexes.
+*  <b>`name`</b>: A name for this operation (optional).
+
+##### Returns:
+
+
+*  <b>`output`</b>: A stacked `Tensor` with the same type as `values`.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: If `axis` is out of the range [-(R+1), R+1).
+
+
+- - -
+
 ### `tf.pack(values, axis=0, name='pack')` {#pack}
+
+DEPRECATED: Use stack.
 
 Packs a list of rank-`R` tensors into one rank-`(R+1)` tensor.
 
@@ -949,7 +998,54 @@ This is the opposite of unpack.  The numpy equivalent is
 
 - - -
 
+### `tf.unstack(value, num=None, axis=0, name='unstack')` {#unstack}
+
+Unpacks the given dimension of a rank-`R` tensor into rank-`(R-1)` tensors.
+
+Unpacks `num` tensors from `value` by chipping it along the `axis` dimension.
+If `num` is not specified (the default), it is inferred from `value`'s shape.
+If `value.shape[axis]` is not known, `ValueError` is raised.
+
+For example, given a tensor of shape `(A, B, C, D)`;
+
+If `axis == 0` then the i'th tensor in `output` is the slice
+  `value[i, :, :, :]` and each tensor in `output` will have shape `(B, C, D)`.
+  (Note that the dimension unpacked along is gone, unlike `split`).
+
+If `axis == 1` then the i'th tensor in `output` is the slice
+  `value[:, i, :, :]` and each tensor in `output` will have shape `(A, C, D)`.
+Etc.
+
+This is the opposite of pack.  The numpy equivalent is
+
+    tf.unstack(x, n) = list(x)
+
+##### Args:
+
+
+*  <b>`value`</b>: A rank `R > 0` `Tensor` to be unstacked.
+*  <b>`num`</b>: An `int`. The length of the dimension `axis`. Automatically inferred
+    if `None` (the default).
+*  <b>`axis`</b>: An `int`. The axis to unstack along. Defaults to the first
+    dimension. Supports negative indexes.
+*  <b>`name`</b>: A name for the operation (optional).
+
+##### Returns:
+
+  The list of `Tensor` objects unstacked from `value`.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: If `num` is unspecified and cannot be inferred.
+*  <b>`ValueError`</b>: If `axis` is out of the range [-R, R).
+
+
+- - -
+
 ### `tf.unpack(value, num=None, axis=0, name='unpack')` {#unpack}
+
+DEPRECATED: Use unstack.
 
 Unpacks the given dimension of a rank-`R` tensor into rank-`(R-1)` tensors.
 
@@ -1997,18 +2093,20 @@ this operation will permute `params` accordingly.
 
 Gather values or slices from `params` according to `indices`.
 
-`params` is a Tensor of rank `R` and `indices` is a Tensor of rank `M`.
+`params` is a Tensor of rank `P` and `indices` is a Tensor of rank `Q`.
 
 `indices` must be integer tensor, containing indices into `params`.
-It must be shape `[d_0, ..., d_N, R]` where `0 < R <= M`.
+It must be shape `[d_0, ..., d_{Q-2}, K]` where `0 < K <= P`.
 
-The innermost dimension of `indices` (with length `R`) corresponds to
-indices into elements (if `R = M`) or slices (if `R < M`) along the `N`th
+The innermost dimension of `indices` (with length `K`) corresponds to
+indices into elements (if `K = P`) or slices (if `K < P`) along the `K`th
 dimension of `params`.
 
 Produces an output tensor with shape
 
-    [d_0, ..., d_{n-1}, params.shape[R], ..., params.shape[M-1]].
+```
+[d_0, ..., d_{Q-2}, params.shape[K], ..., params.shape[P-1]].
+```
 
 Some examples below.
 
@@ -2090,15 +2188,15 @@ Batched indexing into a 3-tensor:
 ##### Args:
 
 
-*  <b>`params`</b>: A `Tensor`. `M-D`.  The tensor from which to gather values.
+*  <b>`params`</b>: A `Tensor`. `P-D`.  The tensor from which to gather values.
 *  <b>`indices`</b>: A `Tensor`. Must be one of the following types: `int32`, `int64`.
-    `(N+1)-D`.  Index tensor having shape `[d_0, ..., d_N, R]`.
+    `Q-D`.  Index tensor having shape `[d_0, ..., d_{Q-2}, K]`.
 *  <b>`name`</b>: A name for the operation (optional).
 
 ##### Returns:
 
   A `Tensor`. Has the same type as `params`.
-  `(N+M-R)-D`.  Values from `params` gathered from indices given by
+  `(P+Q-K-1)-D`.  Values from `params` gathered from indices given by
   `indices`.
 
 
@@ -2473,5 +2571,190 @@ tf.sequence_mask([1, 3, 2], 5) =
 
 
 *  <b>`ValueError`</b>: if the arguments have invalid rank.
+
+
+- - -
+
+### `tf.dequantize(input, min_range, max_range, mode=None, name=None)` {#dequantize}
+
+Dequantize the 'input' tensor into a float Tensor.
+
+[min_range, max_range] are scalar floats that specify the range for
+the 'input' data. The 'mode' attribute controls exactly which calculations are
+used to convert the float values to their quantized equivalents.
+
+In 'MIN_COMBINED' mode, each value of the tensor will undergo the following:
+
+```
+if T == qint8, in[i] += (range(T) + 1)/ 2.0
+out[i] = min_range + (in[i]* (max_range - min_range) / range(T))
+```
+here `range(T) = numeric_limits<T>::max() - numeric_limits<T>::min()`
+
+*MIN_COMBINED Mode Example*
+
+If the input comes from a QuantizedRelu6, the output type is
+quint8 (range of 0-255) but the possible range of QuantizedRelu6 is
+0-6.  The min_range and max_range values are therefore 0.0 and 6.0.
+Dequantize on quint8 will take each value, cast to float, and multiply
+by 6 / 255.
+Note that if quantizedtype is qint8, the operation will additionally add
+each value by 128 prior to casting.
+
+If the mode is 'MIN_FIRST', then this approach is used:
+
+```
+number_of_steps = 1 << (# of bits in T)
+range_adjust = number_of_steps / (number_of_steps - 1)
+range = (range_max - range_min) * range_adjust
+range_scale = range / number_of_steps
+const double offset_input = static_cast<double>(input) - lowest_quantized;
+result = range_min + ((input - numeric_limits<T>::min()) * range_scale)
+```
+
+##### Args:
+
+
+*  <b>`input`</b>: A `Tensor`. Must be one of the following types: `qint8`, `quint8`, `qint16`, `quint16`, `qint32`.
+*  <b>`min_range`</b>: A `Tensor` of type `float32`.
+    The minimum scalar value possibly produced for the input.
+*  <b>`max_range`</b>: A `Tensor` of type `float32`.
+    The maximum scalar value possibly produced for the input.
+*  <b>`mode`</b>: An optional `string` from: `"MIN_COMBINED", "MIN_FIRST"`. Defaults to `"MIN_COMBINED"`.
+*  <b>`name`</b>: A name for the operation (optional).
+
+##### Returns:
+
+  A `Tensor` of type `float32`.
+
+
+- - -
+
+### `tf.quantize_v2(input, min_range, max_range, T, mode=None, name=None)` {#quantize_v2}
+
+Quantize the 'input' tensor of type float to 'output' tensor of type 'T'.
+
+[min_range, max_range] are scalar floats that specify the range for
+the 'input' data. The 'mode' attribute controls exactly which calculations are
+used to convert the float values to their quantized equivalents.
+
+In 'MIN_COMBINED' mode, each value of the tensor will undergo the following:
+
+```
+out[i] = (in[i] - min_range) * range(T) / (max_range - min_range)
+if T == qint8, out[i] -= (range(T) + 1) / 2.0
+```
+here `range(T) = numeric_limits<T>::max() - numeric_limits<T>::min()`
+
+*MIN_COMBINED Mode Example*
+
+Assume the input is type float and has a possible range of [0.0, 6.0] and the
+output type is quint8 ([0, 255]). The min_range and max_range values should be
+specified as 0.0 and 6.0. Quantizing from float to quint8 will multiply each
+value of the input by 255/6 and cast to quint8.
+
+If the output type was qint8 ([-128, 127]), the operation will additionally
+subtract each value by 128 prior to casting, so that the range of values aligns
+with the range of qint8.
+
+If the mode is 'MIN_FIRST', then this approach is used:
+
+```
+number_of_steps = 1 << (# of bits in T)
+range_adjust = number_of_steps / (number_of_steps - 1)
+range = (range_max - range_min) * range_adjust
+range_scale = number_of_steps / range
+quantized = round(input * range_scale) - round(range_min * range_scale) +
+  numeric_limits<T>::min()
+quantized = max(quantized, numeric_limits<T>::min())
+quantized = min(quantized, numeric_limits<T>::max())
+```
+
+The biggest difference between this and MIN_COMBINED is that the minimum range
+is rounded first, before it's subtracted from the rounded value. With
+MIN_COMBINED, a small bias is introduced where repeated iterations of quantizing
+and dequantizing will introduce a larger and larger error.
+
+One thing to watch out for is that the operator may choose to adjust the
+requested minimum and maximum values slightly during the quantization process,
+so you should always use the output ports as the range for further calculations.
+For example, if the requested minimum and maximum values are close to equal,
+they will be separated by a small epsilon value to prevent ill-formed quantized
+buffers from being created. Otherwise, you can end up with buffers where all the
+quantized values map to the same float value, which causes problems for
+operations that have to perform further calculations on them.
+
+##### Args:
+
+
+*  <b>`input`</b>: A `Tensor` of type `float32`.
+*  <b>`min_range`</b>: A `Tensor` of type `float32`.
+    The minimum scalar value possibly produced for the input.
+*  <b>`max_range`</b>: A `Tensor` of type `float32`.
+    The maximum scalar value possibly produced for the input.
+*  <b>`T`</b>: A `tf.DType` from: `tf.qint8, tf.quint8, tf.qint16, tf.quint16, tf.qint32`.
+*  <b>`mode`</b>: An optional `string` from: `"MIN_COMBINED", "MIN_FIRST"`. Defaults to `"MIN_COMBINED"`.
+*  <b>`name`</b>: A name for the operation (optional).
+
+##### Returns:
+
+  A tuple of `Tensor` objects (output, output_min, output_max).
+
+*  <b>`output`</b>: A `Tensor` of type `T`. The quantized data produced from the float input.
+*  <b>`output_min`</b>: A `Tensor` of type `float32`. The actual minimum scalar value used for the output.
+*  <b>`output_max`</b>: A `Tensor` of type `float32`. The actual maximum scalar value used for the output.
+
+
+- - -
+
+### `tf.quantized_concat(concat_dim, values, input_mins, input_maxes, name=None)` {#quantized_concat}
+
+Concatenates quantized tensors along one dimension.
+
+##### Args:
+
+
+*  <b>`concat_dim`</b>: A `Tensor` of type `int32`.
+    0-D.  The dimension along which to concatenate.  Must be in the
+    range [0, rank(values)).
+*  <b>`values`</b>: A list of at least 2 `Tensor` objects of the same type.
+    The `N` Tensors to concatenate. Their ranks and types must match,
+    and their sizes must match in all dimensions except `concat_dim`.
+*  <b>`input_mins`</b>: A list with the same number of `Tensor` objects as `values` of `Tensor` objects of type `float32`.
+    The minimum scalar values for each of the input tensors.
+*  <b>`input_maxes`</b>: A list with the same number of `Tensor` objects as `values` of `Tensor` objects of type `float32`.
+    The maximum scalar values for each of the input tensors.
+*  <b>`name`</b>: A name for the operation (optional).
+
+##### Returns:
+
+  A tuple of `Tensor` objects (output, output_min, output_max).
+
+*  <b>`output`</b>: A `Tensor`. Has the same type as `values`. A `Tensor` with the concatenation of values stacked along the
+    `concat_dim` dimension.  This tensor's shape matches that of `values` except
+    in `concat_dim` where it has the sum of the sizes.
+*  <b>`output_min`</b>: A `Tensor` of type `float32`. The float value that the minimum quantized output value represents.
+*  <b>`output_max`</b>: A `Tensor` of type `float32`. The float value that the maximum quantized output value represents.
+
+
+- - -
+
+### `tf.setdiff1d(x, y, index_dtype=tf.int32, name=None)` {#setdiff1d}
+
+Returns the difference between the `x` and `y` treated as sets.
+
+##### Args:
+
+
+*  <b>`x`</b>: Set of values not assumed to be unique.
+*  <b>`y`</b>: Set of values not assumed to be unique.
+*  <b>`index_dtype`</b>: Output index type (`tf.int32`, `tf.int64`) default: `tf.int32`
+*  <b>`name`</b>: A name for the operation (optional).
+
+
+##### Returns:
+
+  A `Tensor` the same type as `x` and `y`
+  A `Tensor` that is of type `index_dtype` representing indices from .
 
 
