@@ -22,7 +22,6 @@ limitations under the License.
 #include <string.h>
 #include <map>
 #include <vector>
-#include "public/gemmlowp.h"
 #include "tensorflow/core/framework/numeric_op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -649,42 +648,19 @@ template class LaunchConv2DOp<GPUDevice, float>;
 
 void ParallelFor(OpKernelContext* context, int64 begin, int64 end,
                  std::function<void(int64, int64)> task_function) {
-#if 0
-  auto& worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
-  const int num_tasks = worker_threads.num_threads;
-  thread::ThreadPool* thread_pool = worker_threads.workers;
-  const int64 total_elements = end - begin;
-  const int64 elements_per_task =
-      (total_elements + (num_tasks - 1)) / num_tasks;
-  gemmlowp::BlockingCounter outstanding_tasks;
-  outstanding_tasks.Reset(num_tasks);
-  for (int task_index = 0; task_index < num_tasks; ++task_index) {
-    const int64 task_begin = begin + (task_index * elements_per_task);
-    const int64 task_end = std::min(end, task_begin + elements_per_task);
-    if (task_index < (num_tasks - 1)) {
-      thread_pool->Schedule(
-          [&outstanding_tasks, task_function, task_begin, task_end] {
-            task_function(task_begin, task_end);
-            outstanding_tasks.DecrementCount();
-          });
-    } else {
-      task_function(task_begin, task_end);
-      outstanding_tasks.DecrementCount();
-    }
-  }
-  outstanding_tasks.Wait();
-#else
   auto& worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
   thread::ThreadPool* thread_pool = worker_threads.workers;
   const int64 total_elements = end - begin;
+  // This is a bit of an arbitrary number, but was found to work well for
+  // typical models we've been profiling on various devices.
+  const int64 element_cost = 10000000;
   thread_pool->ParallelFor(
-      total_elements, 100000,
+      total_elements, element_cost,
       [begin, task_function](int64 begin_offset, int64 end_offset) {
         const int64 task_begin = begin + begin_offset;
         const int64 task_end = begin + end_offset;
         task_function(task_begin, task_end);
       });
-#endif
 }
 
 }  // namespace tensorflow

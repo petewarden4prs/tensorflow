@@ -463,15 +463,3 @@ http_file(
   name = "weblas_weblas_js",
   url = "https://raw.githubusercontent.com/waylonflinn/weblas/v0.9.0/dist/weblas.js",
 )
-android_sdk_repository(
-   name = "androidsdk",
-   api_level = 23,
-   build_tools_version = "23.0.2",
-   # Replace with path to Android SDK on your system
-   path = "/usr/local/google/home/petewarden/Downloads/android-sdk-linux/",
-)
-
-android_ndk_repository(
-   name="androidndk",
-   path="/usr/local/google/home/petewarden/android-ndk-r10e/",
-   api_level=19)
