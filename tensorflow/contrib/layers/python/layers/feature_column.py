@@ -32,22 +32,27 @@ Typical usage example:
 
   ```python
   # Define features and transformations
-  country = sparse_column_with_keys(column_name="native_country",
-                                    keys=["US", "BRA", ...])
-  country_emb = embedding_column(sparse_id_column=country, dimension=3,
-                                 combiner="sum")
-  occupation = sparse_column_with_hash_bucket(column_name="occupation",
-                                              hash_bucket_size=1000)
-  occupation_emb = embedding_column(sparse_id_column=occupation, dimension=16,
-                                   combiner="sum")
-  occupation_x_country = crossed_column(columns=[occupation, country],
-                                        hash_bucket_size=10000)
-  age = real_valued_column("age")
-  age_buckets = bucketized_column(
-      source_column=age,
+  sparse_feature_a = sparse_column_with_keys(
+      column_name="sparse_feature_a", keys=["AB", "CD", ...])
+
+  embedding_feature_a = embedding_column(
+      sparse_id_column=sparse_feature_a, dimension=3, combiner="sum")
+
+  sparse_feature_b = sparse_column_with_hash_bucket(
+      column_name="sparse_feature_b", hash_bucket_size=1000)
+
+  embedding_feature_b = embedding_column(
+      sparse_id_column=sparse_feature_b, dimension=16, combiner="sum")
+
+  crossed_feature_a_x_b = crossed_column(
+      columns=[sparse_feature_a, sparse_feature_b], hash_bucket_size=10000)
+
+  real_feature = real_valued_column("real_feature")
+  real_feature_buckets = bucketized_column(
+      source_column=real_feature,
       boundaries=[18, 25, 30, 35, 40, 45, 50, 55, 60, 65])
 
-  my_features = [occupation_emb, age_buckets, country_emb]
+  my_features = [embedding_feature_b, real_feature_buckets, embedding_feature_a]
   # Building model via layers
   columns_to_tensor = parse_feature_columns_from_examples(
       serialized=my_data,
@@ -76,13 +81,12 @@ import collections
 import math
 import six
 
-from tensorflow.contrib.framework.python.framework import deprecation
 from tensorflow.contrib.layers.python.layers import layers
 from tensorflow.contrib.layers.python.ops import bucketization_op
 from tensorflow.contrib.layers.python.ops import sparse_feature_cross_op
 from tensorflow.contrib.lookup import lookup_ops as contrib_lookup_ops
 from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import ops
+from tensorflow.python.framework import sparse_tensor as sparse_tensor_py
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import math_ops
@@ -90,6 +94,7 @@ from tensorflow.python.ops import parsing_ops
 from tensorflow.python.ops import sparse_ops
 from tensorflow.python.ops import string_ops
 from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.util import deprecation
 
 
 class _LinearEmbeddingLookupArguments(
@@ -390,7 +395,7 @@ class _SparseColumnIntegerized(_SparseColumn):
     sparse_id_values = math_ops.mod(columns_to_tensors[self.name].values,
                                     self.bucket_size,
                                     name="mod")
-    columns_to_tensors[self] = ops.SparseTensor(
+    columns_to_tensors[self] = sparse_tensor_py.SparseTensor(
         columns_to_tensors[self.name].indices, sparse_id_values,
         columns_to_tensors[self.name].shape)
 
@@ -464,7 +469,7 @@ class _SparseColumnHashed(_SparseColumn):
 
     sparse_id_values = string_ops.string_to_hash_bucket_fast(
         sparse_values, self.bucket_size, name="lookup")
-    columns_to_tensors[self] = ops.SparseTensor(
+    columns_to_tensors[self] = sparse_tensor_py.SparseTensor(
         sparse_tensor.indices, sparse_id_values, sparse_tensor.shape)
 
 
@@ -1452,7 +1457,8 @@ class _BucketizedColumn(_FeatureColumn, collections.namedtuple(
 
     indices = math_ops.to_int64(array_ops.transpose(array_ops.pack((i1, i2))))
     shape = math_ops.to_int64(array_ops.pack([batch_size, dimension]))
-    sparse_id_values = ops.SparseTensor(indices, bucket_indices, shape)
+    sparse_id_values = sparse_tensor_py.SparseTensor(
+        indices, bucket_indices, shape)
 
     return sparse_id_values
 

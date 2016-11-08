@@ -33,6 +33,7 @@ string tensor.
 ## Splitting
 
 @@string_split
+@@substr
 
 ## Conversion
 
@@ -50,6 +51,7 @@ import six
 from tensorflow.python.framework import common_shapes
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import sparse_tensor
 
 # pylint: disable=unused-import
 from tensorflow.python.ops import gen_string_ops
@@ -107,7 +109,7 @@ def string_split(source, delimiter=" "):  # pylint: disable=invalid-name
   indices.set_shape([None, 2])
   values.set_shape([None])
   shape.set_shape([2])
-  return ops.SparseTensor(indices, values, shape)
+  return sparse_tensor.SparseTensor(indices, values, shape)
 
 
 ops.NotDifferentiable("StringToHashBucket")
@@ -135,3 +137,4 @@ def _ReduceJoinShape(op):
 
 ops.RegisterShape("StringJoin")(common_shapes.call_cpp_shape_fn)
 ops.RegisterShape("StringSplit")(common_shapes.call_cpp_shape_fn)
+ops.RegisterShape("Substr")(common_shapes.call_cpp_shape_fn)

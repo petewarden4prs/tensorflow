@@ -70,6 +70,31 @@ Status ComputeTheoreticalJacobianTranspose(
 }
 
 template <typename T>
+Tensor DeepCopyTensor(const Tensor& t) {
+  Tensor ret = Tensor(t.dtype(), t.shape());
+  auto ret_flat = ret.flat<T>();
+  auto t_flat = t.flat<T>();
+  for (int i = 0; i < t.NumElements(); i++) {
+    ret_flat(i) = t_flat(i);
+  }
+  return ret;
+}
+
+template <typename T>
+Status EvaluateGraph(ClientSession& session, const ops::Output& x,
+                     const ops::Output& y, const Tensor* x_data,
+                     Tensor* y_data) {
+  std::vector<Tensor> outputs;
+  TF_RETURN_IF_ERROR(session.Run({{x, *x_data}}, {y}, &outputs));
+  if (outputs[0].SharesBufferWith(*x_data)) {
+    *y_data = DeepCopyTensor<T>(outputs[0]);
+  } else {
+    *y_data = outputs[0];
+  }
+  return Status::OK();
+}
+
+template <typename T>
 Status ComputeNumericJacobianTranspose(const Scope& scope, const ops::Output& x,
                                        const TensorShape& x_shape,
                                        const ops::Output& y,
@@ -78,25 +103,27 @@ Status ComputeNumericJacobianTranspose(const Scope& scope, const ops::Output& x,
                                        Tensor* jacobian_t) {
   const int64 x_size = x_shape.num_elements();
   const int64 y_size = y_shape.num_elements();
+  // Create copies of x_data since the underlying buffer of the input Tensor is
+  // not copied for some operations (i.e. Identity), which can lead to incorrect
+  // results for the centered difference calculation.
   auto x_data_flat = x_data->flat<T>();
 
   // Compute the numeric Jacobian one column at a time by perturbing each
   // element of 'x_data' (positively and negatively) by 'delta', and
   // updating the jacobian with the centered difference.
   ClientSession session(scope);
-  std::vector<Tensor> yout;
   auto jacobian = jacobian_t->matrix<T>();
   for (int r = 0; r < x_size; ++r) {
     // Store current value of 'x' at 'r'.
     T v = x_data_flat(r);
     // Evaluate at positive delta.
     x_data_flat(r) = v + delta;
-    TF_RETURN_IF_ERROR(session.Run({{x, *x_data}}, {y}, &yout));
-    Tensor y_pos = yout[0];
+    Tensor y_pos;
+    TF_RETURN_IF_ERROR(EvaluateGraph<T>(session, x, y, x_data, &y_pos));
     // Evaluate at negative delta.
     x_data_flat(r) = v - delta;
-    TF_RETURN_IF_ERROR(session.Run({{x, *x_data}}, {y}, &yout));
-    Tensor y_neg = yout[0];
+    Tensor y_neg;
+    TF_RETURN_IF_ERROR(EvaluateGraph<T>(session, x, y, x_data, &y_neg));
     // Compute element-wise centered difference and store in Jacobian.
     auto y_pos_flat = y_pos.flat<T>();
     auto y_neg_flat = y_neg.flat<T>();
@@ -110,19 +137,14 @@ Status ComputeNumericJacobianTranspose(const Scope& scope, const ops::Output& x,
   return Status::OK();
 }
 
-}  // namespace
-
 template <typename T>
-Status ComputeGradientError(const Scope& scope, const ops::Output& x,
-                            const TensorShape& x_shape, const ops::Output& y,
-                            const TensorShape& y_shape, T* max_error) {
+Status ComputeGradientErrorInternal(const Scope& scope, const ops::Output& x,
+                                    const TensorShape& x_shape,
+                                    const ops::Output& y,
+                                    const TensorShape& y_shape, Tensor* x_data,
+                                    T* max_error) {
   const int64 x_size = x_shape.num_elements();
   const int64 y_size = y_shape.num_elements();
-
-  // Initialize 'x_data' to random values.
-  Tensor x_data(x.type(), x_shape);
-  auto x_data_flat = x_data.flat<T>();
-  x_data_flat.setRandom();
 
   // Initialize theoretical Jacobian to zeros.
   Tensor jacobian_t(x.type(), {x_size, y_size});
@@ -131,7 +153,7 @@ Status ComputeGradientError(const Scope& scope, const ops::Output& x,
 
   // Compute theoretical Jacobian.
   TF_RETURN_IF_ERROR(ComputeTheoreticalJacobianTranspose<T>(
-      scope, x, x_shape, x_data, y, y_shape, &jacobian_t));
+      scope, x, x_shape, *x_data, y, y_shape, &jacobian_t));
 
   // Initialize numeric Jacobian to zeros.
   Tensor jacobian_n(x.type(), {x_size, y_size});
@@ -140,7 +162,7 @@ Status ComputeGradientError(const Scope& scope, const ops::Output& x,
 
   // Compute numeric Jacobian.
   TF_RETURN_IF_ERROR(ComputeNumericJacobianTranspose<T>(
-      scope, x, x_shape, y, y_shape, 1e-3, &x_data, &jacobian_n));
+      scope, x, x_shape, y, y_shape, 1e-3, x_data, &jacobian_n));
 
   // Compute the maximum error between theoretical and numeric Jacobians.
   *max_error = 0.0;
@@ -154,10 +176,39 @@ Status ComputeGradientError(const Scope& scope, const ops::Output& x,
   return Status::OK();
 }
 
+}  // namespace
+
+template <typename T>
+Status ComputeGradientError(const Scope& scope, const ops::Output& x,
+                            const TensorShape& x_shape, const ops::Output& y,
+                            const TensorShape& y_shape, T* max_error) {
+  // Initialize 'x_data' to random values.
+  Tensor x_data(x.type(), x_shape);
+  auto x_data_flat = x_data.flat<T>();
+  x_data_flat.setRandom();
+  // Compute gradient error.
+  return ComputeGradientErrorInternal(scope, x, x_shape, y, y_shape, &x_data,
+                                      max_error);
+}
+
+template <typename T>
+Status ComputeGradientError(const Scope& scope, const ops::Output& x,
+                            const Tensor& x_init_value, const ops::Output& y,
+                            const TensorShape& y_shape, T* max_error) {
+  // Initialize 'x_data' from 'x_init_value'.
+  Tensor x_data(x_init_value);
+  // Compute gradient error.
+  return ComputeGradientErrorInternal(scope, x, x_data.shape(), y, y_shape,
+                                      &x_data, max_error);
+}
+
 #define INSTANTIATE_GRAD_ERR_TYPE(T)                                        \
   template Status ComputeGradientError<T>(                                  \
       const Scope& scope, const ops::Output& x, const TensorShape& x_shape, \
-      const ops::Output& y, const TensorShape& y_shape, T* max_error)
+      const ops::Output& y, const TensorShape& y_shape, T* max_error);      \
+  template Status ComputeGradientError<T>(                                  \
+      const Scope& scope, const ops::Output& x, const Tensor& x_init_value, \
+      const ops::Output& y, const TensorShape& y_shape, T* max_error);
 
 INSTANTIATE_GRAD_ERR_TYPE(float);
 INSTANTIATE_GRAD_ERR_TYPE(double);

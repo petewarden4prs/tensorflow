@@ -22,7 +22,6 @@ limitations under the License.
 #include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/lib/gtl/stl_util.h"
 #include "tensorflow/core/lib/io/path.h"
-#include "tensorflow/core/lib/strings/scanner.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/env.h"
@@ -39,7 +38,7 @@ constexpr int kNumThreads = 8;
 // Run a function in parallel using a ThreadPool, but skip the ThreadPool
 // on the iOS platform due to its problems with more than a few threads.
 void ForEach(int first, int last, std::function<void(int)> f) {
-#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
+#if TARGET_OS_IPHONE
   for (int i = first; i < last; i++) {
     f(i);
   }
@@ -62,9 +61,7 @@ string FileSystem::TranslateName(const string& name) const {
 
 Status FileSystem::IsDirectory(const string& name) {
   // Check if path exists.
-  if (!FileExists(name)) {
-    return Status(tensorflow::error::NOT_FOUND, "Path not found");
-  }
+  TF_RETURN_IF_ERROR(FileExists(name));
   FileStatistics stat;
   TF_RETURN_IF_ERROR(Stat(name, &stat));
   if (stat.is_directory) {
@@ -78,43 +75,6 @@ RandomAccessFile::~RandomAccessFile() {}
 WritableFile::~WritableFile() {}
 
 FileSystemRegistry::~FileSystemRegistry() {}
-
-void ParseURI(StringPiece remaining, StringPiece* scheme, StringPiece* host,
-              StringPiece* path) {
-  // 0. Parse scheme
-  // Make sure scheme matches [a-zA-Z][0-9a-zA-Z.]*
-  // TODO(keveman): Allow "+" and "-" in the scheme.
-  if (!strings::Scanner(remaining)
-           .One(strings::Scanner::LETTER)
-           .Many(strings::Scanner::LETTER_DIGIT_DOT)
-           .StopCapture()
-           .OneLiteral("://")
-           .GetResult(&remaining, scheme)) {
-    // If there's no scheme, assume the entire string is a path.
-    scheme->clear();
-    host->clear();
-    *path = remaining;
-    return;
-  }
-
-  // 1. Parse host
-  if (!strings::Scanner(remaining).ScanUntil('/').GetResult(&remaining, host)) {
-    // No path, so the rest of the URI is the host.
-    *host = remaining;
-    path->clear();
-    return;
-  }
-
-  // 2. The rest is the path
-  *path = remaining;
-}
-
-string CreateURI(StringPiece scheme, StringPiece host, StringPiece path) {
-  if (scheme.empty()) {
-    return path.ToString();
-  }
-  return strings::StrCat(scheme, "://", host, path);
-}
 
 Status FileSystem::GetMatchingPaths(const string& pattern,
                                     std::vector<string>* results) {
@@ -181,9 +141,10 @@ Status FileSystem::DeleteRecursively(const string& dirname,
   *undeleted_files = 0;
   *undeleted_dirs = 0;
   // Make sure that dirname exists;
-  if (!FileExists(dirname)) {
+  Status exists_status = FileExists(dirname);
+  if (!exists_status.ok()) {
     (*undeleted_dirs)++;
-    return Status(error::NOT_FOUND, "Directory doesn't exist");
+    return exists_status;
   }
   std::deque<string> dir_q;      // Queue for the BFS
   std::vector<string> dir_list;  // List of all dirs discovered
@@ -237,10 +198,16 @@ Status FileSystem::DeleteRecursively(const string& dirname,
 
 Status FileSystem::RecursivelyCreateDir(const string& dirname) {
   StringPiece scheme, host, remaining_dir;
-  ParseURI(dirname, &scheme, &host, &remaining_dir);
+  io::ParseURI(dirname, &scheme, &host, &remaining_dir);
   std::vector<StringPiece> sub_dirs;
-  while (!FileExists(CreateURI(scheme, host, remaining_dir)) &&
-         !remaining_dir.empty()) {
+  while (!remaining_dir.empty()) {
+    Status status = FileExists(io::CreateURI(scheme, host, remaining_dir));
+    if (status.ok()) {
+      break;
+    }
+    if (status.code() != error::Code::NOT_FOUND) {
+      return status;
+    }
     // Basename returns "" for / ending dirs.
     if (!remaining_dir.ends_with("/")) {
       sub_dirs.push_back(io::Basename(remaining_dir));
@@ -255,7 +222,7 @@ Status FileSystem::RecursivelyCreateDir(const string& dirname) {
   string built_path = remaining_dir.ToString();
   for (const StringPiece sub_dir : sub_dirs) {
     built_path = io::JoinPath(built_path, sub_dir);
-    TF_RETURN_IF_ERROR(CreateDir(CreateURI(scheme, host, built_path)));
+    TF_RETURN_IF_ERROR(CreateDir(io::CreateURI(scheme, host, built_path)));
   }
   return Status::OK();
 }

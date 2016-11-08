@@ -31,6 +31,7 @@ from tensorflow.contrib.layers.python.layers import utils
 
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import sparse_tensor
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import init_ops
@@ -1217,7 +1218,7 @@ def _inner_flatten(inputs, new_rank, output_collections=None, scope=None):
     TypeError: `inputs` is not a `Tensor` or `SparseTensor`.
   """
   with ops.name_scope(scope, 'InnerFlatten', [inputs, new_rank]) as sc:
-    if isinstance(inputs, ops.SparseTensor):
+    if isinstance(inputs, sparse_tensor.SparseTensor):
       flattened = _sparse_inner_flatten(inputs, new_rank)
     else:
       inputs = ops.convert_to_tensor(inputs)
@@ -1970,7 +1971,7 @@ def legacy_fully_connected(x,
     dtype = x.dtype.base_dtype
 
     weight_collections = set(list(weight_collections or []) +
-                             [ops.GraphKeys.VARIABLES])
+                             [ops.GraphKeys.GLOBAL_VARIABLES])
     w = variable_scope.get_variable('weights',
                                     shape=[num_input_units, num_output_units],
                                     dtype=dtype,
@@ -1984,7 +1985,7 @@ def legacy_fully_connected(x,
 
     if bias_init is not None:
       bias_collections = set(list(bias_collections or []) +
-                             [ops.GraphKeys.VARIABLES])
+                             [ops.GraphKeys.GLOBAL_VARIABLES])
       b = variable_scope.get_variable('bias',
                                       shape=[num_output_units],
                                       dtype=dtype,

@@ -71,12 +71,15 @@ from tensorflow.core.util.event_pb2 import *
 from tensorflow.python.framework.framework_lib import *
 from tensorflow.python.framework.versions import *
 from tensorflow.python.framework import errors
+from tensorflow.python.framework import graph_util
 
 # Session
 from tensorflow.python.client.client_lib import *
 
 # Ops
 from tensorflow.python.ops.standard_ops import *
+
+# pylint: enable=wildcard-import
 
 # Bring in subpackages.
 from tensorflow.python.ops import nn
@@ -228,6 +231,7 @@ _allowed_symbols.extend([
     'errors',
     'flags',
     'gfile',
+    'graph_util',
     'image',
     'logging',
     'newaxis',
