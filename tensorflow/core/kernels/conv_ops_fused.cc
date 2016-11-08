@@ -21,7 +21,6 @@ limitations under the License.
 #include <string.h>
 #include <map>
 #include <vector>
-#include "public/gemmlowp.h"
 #include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/numeric_op.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -34,7 +33,6 @@ limitations under the License.
 #include "tensorflow/core/kernels/conv_ops.h"
 #include "tensorflow/core/kernels/gemm_functors.h"
 #include "tensorflow/core/kernels/image_resizer_state.h"
-#include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/util/mirror_pad_mode.h"
 #include "tensorflow/core/util/padding.h"
 #include "tensorflow/core/util/tensor_format.h"
@@ -198,22 +196,11 @@ class FusedResizeAndPadConvFunctor {
     core::ScopedUnref unref_resized_cache(resize_cache_resource);
     T1* resize_cache = resize_cache_resource->data;
 
-    auto& worker_threads =
-        *(context->device()->tensorflow_cpu_worker_threads());
-    const int num_threads = worker_threads.num_threads;
-    thread::ThreadPool* thread_pool = worker_threads.workers;
-    gemmlowp::BlockingCounter outstanding_tasks;
-
     const T1* input_data = input.flat<T1>().data();
     const int64 input_height = input.shape().dim_sizes()[1];
     const int64 input_width = input.shape().dim_sizes()[2];
 
     int end_cached_lines = std::numeric_limits<int>::min();
-
-    // These variables keep track of which patches we still need to generate.
-    int patch_start_batch = 0;
-    int patch_start_out_y = 0;
-    int patch_start_out_x = 0;
 
     for (int batch = 0; batch < input_batches; ++batch) {
       const T1* input_batch_start =
@@ -226,120 +213,103 @@ class FusedResizeAndPadConvFunctor {
         const int cache_end_y = std::min(
             in_y_end, std::max((in_y_origin + cache_height), end_cached_lines));
         if (end_cached_lines < (in_y_origin + filter_height)) {
-          outstanding_tasks.Reset(num_threads);
-          const int lines_per_task =
-              ((cache_end_y - cache_start_y) + (num_threads - 1)) / num_threads;
-          for (int task_index = 0; task_index < num_threads; ++task_index) {
-            const int task_cache_start_y =
-                cache_start_y + (task_index * lines_per_task);
-            const int task_cache_end_y =
-                std::min(cache_end_y, task_cache_start_y + lines_per_task);
-            std::function<void()> thread_function = [&outstanding_tasks,
-                                                     task_cache_start_y,
-                                                     task_cache_end_y,
-                                                     cache_height, resize_cache,
-                                                     cache_line_width,
-                                                     input_depth, top_padding,
-                                                     pad_offset, resized_height,
-                                                     st, input_batch_start,
-                                                     cache_start_x, cache_end_x,
-                                                     left_padding,
-                                                     resized_width, input_width,
-                                                     padded_width,
-                                                     padded_height]() {
-              for (int cache_y = task_cache_start_y; cache_y < task_cache_end_y;
-                   ++cache_y) {
-                int cache_index_y;
-                if (cache_y < 0) {
-                  cache_index_y = cache_height + (cache_y % cache_height);
-                } else {
-                  cache_index_y = cache_y % cache_height;
-                }
-                T1* cache_line_start =
-                    resize_cache +
-                    (cache_index_y * cache_line_width * input_depth);
-                float in_y = (cache_y - top_padding);
-                if (in_y < 0) {
-                  in_y = -(in_y + 1.0f - pad_offset);
-                } else if (in_y >= resized_height) {
-                  in_y = (resized_height * 2.0f) - (in_y + 1.0f + pad_offset);
-                }
-                in_y *= st.height_scale;
-                const int64 top_y_index = static_cast<int64>(std::floor(in_y));
-                const int64 bottom_y_index = std::min(
-                    static_cast<int64>(std::ceil(in_y)), (st.in_height - 1));
-                const T1 y_lerp = in_y - top_y_index;
-                const T1* input_top_row_start =
-                    input_batch_start +
-                    (top_y_index * input_width * input_depth);
-                const T1* input_bottom_row_start =
-                    input_batch_start +
-                    (bottom_y_index * input_width * input_depth);
-                for (int cache_x = cache_start_x; cache_x < cache_end_x;
-                     ++cache_x) {
-                  const int cache_index_x = cache_x - cache_start_x;
-                  T1* cache_line_pixel =
-                      cache_line_start + (cache_index_x * input_depth);
-                  float in_x = (cache_x - left_padding);
-                  if (in_x < 0) {
-                    in_x = -(in_x + 1.0f - pad_offset);
-                  } else if (in_x >= resized_width) {
-                    in_x = (resized_width * 2.0f) - (in_x + 1.0f + pad_offset);
-                  }
-                  in_x *= st.width_scale;
-                  const int64 left_x_index =
-                      static_cast<int64>(std::floor(in_x));
-                  const int64 right_x_index = std::min(
-                      static_cast<int64>(std::ceil(in_x)), (st.in_width - 1));
-                  const T1 x_lerp = in_x - left_x_index;
-                  if ((cache_x < 0) || (cache_x >= padded_width) ||
-                      (cache_y < 0) || (cache_y >= padded_height)) {
-                    std::fill_n(cache_line_pixel, input_depth, T1(0));
+          ParallelFor(
+              context, cache_start_y, cache_end_y,
+              [cache_height, resize_cache, cache_line_width, input_depth,
+               top_padding, pad_offset, resized_height, st, input_batch_start,
+               cache_start_x, cache_end_x, left_padding, resized_width,
+               input_width, padded_width, padded_height](
+                  int64 task_cache_start_y, int64 task_cache_end_y) {
+                for (int cache_y = task_cache_start_y;
+                     cache_y < task_cache_end_y; ++cache_y) {
+                  int cache_index_y;
+                  if (cache_y < 0) {
+                    cache_index_y = cache_height + (cache_y % cache_height);
                   } else {
-                    if (SampleMode == NEAREST) {
-                      const T1* input_top_left_pixel =
-                          input_top_row_start + (left_x_index * input_depth);
-
-                      std::copy_n(input_top_left_pixel, input_depth,
-                                  cache_line_pixel);
+                    cache_index_y = cache_y % cache_height;
+                  }
+                  T1* cache_line_start =
+                      resize_cache +
+                      (cache_index_y * cache_line_width * input_depth);
+                  float in_y = (cache_y - top_padding);
+                  if (in_y < 0) {
+                    in_y = -(in_y + 1.0f - pad_offset);
+                  } else if (in_y >= resized_height) {
+                    in_y = (resized_height * 2.0f) - (in_y + 1.0f + pad_offset);
+                  }
+                  in_y *= st.height_scale;
+                  const int64 top_y_index =
+                      static_cast<int64>(std::floor(in_y));
+                  const int64 bottom_y_index = std::min(
+                      static_cast<int64>(std::ceil(in_y)), (st.in_height - 1));
+                  const T1 y_lerp = in_y - top_y_index;
+                  const T1* input_top_row_start =
+                      input_batch_start +
+                      (top_y_index * input_width * input_depth);
+                  const T1* input_bottom_row_start =
+                      input_batch_start +
+                      (bottom_y_index * input_width * input_depth);
+                  for (int cache_x = cache_start_x; cache_x < cache_end_x;
+                       ++cache_x) {
+                    const int cache_index_x = cache_x - cache_start_x;
+                    T1* cache_line_pixel =
+                        cache_line_start + (cache_index_x * input_depth);
+                    float in_x = (cache_x - left_padding);
+                    if (in_x < 0) {
+                      in_x = -(in_x + 1.0f - pad_offset);
+                    } else if (in_x >= resized_width) {
+                      in_x =
+                          (resized_width * 2.0f) - (in_x + 1.0f + pad_offset);
+                    }
+                    in_x *= st.width_scale;
+                    const int64 left_x_index =
+                        static_cast<int64>(std::floor(in_x));
+                    const int64 right_x_index = std::min(
+                        static_cast<int64>(std::ceil(in_x)), (st.in_width - 1));
+                    const T1 x_lerp = in_x - left_x_index;
+                    if ((cache_x < 0) || (cache_x >= padded_width) ||
+                        (cache_y < 0) || (cache_y >= padded_height)) {
+                      std::fill_n(cache_line_pixel, input_depth, T1(0));
                     } else {
-                      const T1* input_top_left_pixel =
-                          input_top_row_start + (left_x_index * input_depth);
-                      const T1* input_top_right_pixel =
-                          input_top_row_start + (right_x_index * input_depth);
-                      const T1* input_bottom_left_pixel =
-                          input_bottom_row_start + (left_x_index * input_depth);
-                      const T1* input_bottom_right_pixel =
-                          input_bottom_row_start +
-                          (right_x_index * input_depth);
-                      for (int in_channel = 0; in_channel < input_depth;
-                           ++in_channel) {
-                        const T1 top_left = input_top_left_pixel[in_channel];
-                        const T1 top_right = input_top_right_pixel[in_channel];
-                        const T1 bottom_left =
-                            input_bottom_left_pixel[in_channel];
-                        const T1 bottom_right =
-                            input_bottom_right_pixel[in_channel];
-                        const T1 top =
-                            top_left + (top_right - top_left) * x_lerp;
-                        const T1 bottom =
-                            bottom_left + (bottom_right - bottom_left) * x_lerp;
-                        cache_line_pixel[in_channel] =
-                            top + (bottom - top) * y_lerp;
+                      if (SampleMode == NEAREST) {
+                        const T1* input_top_left_pixel =
+                            input_top_row_start + (left_x_index * input_depth);
+
+                        std::copy_n(input_top_left_pixel, input_depth,
+                                    cache_line_pixel);
+                      } else {
+                        const T1* input_top_left_pixel =
+                            input_top_row_start + (left_x_index * input_depth);
+                        const T1* input_top_right_pixel =
+                            input_top_row_start + (right_x_index * input_depth);
+                        const T1* input_bottom_left_pixel =
+                            input_bottom_row_start +
+                            (left_x_index * input_depth);
+                        const T1* input_bottom_right_pixel =
+                            input_bottom_row_start +
+                            (right_x_index * input_depth);
+                        for (int in_channel = 0; in_channel < input_depth;
+                             ++in_channel) {
+                          const T1 top_left = input_top_left_pixel[in_channel];
+                          const T1 top_right =
+                              input_top_right_pixel[in_channel];
+                          const T1 bottom_left =
+                              input_bottom_left_pixel[in_channel];
+                          const T1 bottom_right =
+                              input_bottom_right_pixel[in_channel];
+                          const T1 top =
+                              top_left + (top_right - top_left) * x_lerp;
+                          const T1 bottom =
+                              bottom_left +
+                              (bottom_right - bottom_left) * x_lerp;
+                          cache_line_pixel[in_channel] =
+                              top + (bottom - top) * y_lerp;
+                        }
                       }
                     }
                   }
                 }
-              }
-              outstanding_tasks.DecrementCount();
-            };
-            if (task_index < (num_threads - 1)) {
-              thread_pool->Schedule(thread_function);
-            } else {
-              thread_function();
-            }
-          }
-          outstanding_tasks.Wait();
+              });
           end_cached_lines = cache_end_y;
         }
         for (int out_x = 0; out_x < output_width; ++out_x) {

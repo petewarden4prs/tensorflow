@@ -64,6 +64,22 @@ class LaunchConv2DOp<Eigen::GpuDevice, T> {
 };
 #endif  // GOOGLE_CUDA
 
+// Simple utility function used by ops to multithread basic workloads. To use
+// it, pass begin and end values for the full workload and a std::function that
+// receives a subset of that through the begin and end values for each worker's
+// task. The division of the full workload into worker tasks is handled by the
+// multithreading logic. Here's an example of how to use it:
+// std::vector<float> my_vector(100);
+// ...
+// RunInParallel(context, 0, 100,
+//   [&my_vector](int64 task_begin, int64 task_end) {
+//     for (int64 current = task_begin; current != task_end; ++current) {
+//       my_vector[current] *= 10.0f;
+//     }
+// });
+void ParallelFor(OpKernelContext* context, int64 begin, int64 end,
+                 std::function<void(int64, int64)> task_function);
+
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_KERNELS_CONV_OPS_H
